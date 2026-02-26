@@ -1,7 +1,8 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
+import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam } from '@nestjs/swagger';
 import { MerchantsService } from './merchants.service';
 import { ListMerchantsQueryDto } from './dto/list-merchants-query.dto';
+import { MerchantDetailDto } from './dto/merchant-detail.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 
 @ApiTags('Merchants')
@@ -30,5 +31,24 @@ export class MerchantsController {
             limit: data.limit,
             offset: data.offset,
         };
+    }
+
+    @Get(':id')
+    @UseGuards(JwtAuthGuard)
+    @ApiOperation({ summary: 'Get merchant details by ID or wallet address' })
+    @ApiParam({
+        name: 'id',
+        description: 'Merchant unique ID (UUID) or Stellar wallet address starting with G.',
+        example: 'GMER...',
+    })
+    @ApiResponse({
+        status: 200,
+        description: 'Merchant details retrieved successfully.',
+        type: MerchantDetailDto,
+    })
+    @ApiResponse({ status: 401, description: 'Unauthorized — valid JWT required.' })
+    @ApiResponse({ status: 404, description: 'Merchant not found.' })
+    async getMerchantById(@Param('id') id: string): Promise<MerchantDetailDto> {
+        return this.merchantsService.getMerchantById(id);
     }
 }

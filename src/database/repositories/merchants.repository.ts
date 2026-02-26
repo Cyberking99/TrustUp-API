@@ -10,6 +10,13 @@ export interface MerchantRecord {
     is_active: boolean;
 }
 
+export interface MerchantDetailRecord extends MerchantRecord {
+    description: string;
+    website: string;
+    created_at: string;
+    updated_at: string;
+}
+
 export interface FindAllMerchantsOptions {
     limit: number;
     offset: number;
@@ -51,5 +58,53 @@ export class MerchantsRepository {
             merchants: (data as MerchantRecord[]) ?? [],
             total: count ?? 0,
         };
+    }
+
+    /**
+     * Finds a merchant by its unique ID.
+     */
+    async findById(id: string): Promise<MerchantDetailRecord | null> {
+        const { data, error } = await this.supabaseService
+            .getClient()
+            .from('merchants')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') {
+                return null; // Not found
+            }
+            throw new InternalServerErrorException({
+                code: 'DATABASE_QUERY_ERROR',
+                message: error.message,
+            });
+        }
+
+        return data as MerchantDetailRecord;
+    }
+
+    /**
+     * Finds a merchant by its stellar wallet address.
+     */
+    async findByWallet(wallet: string): Promise<MerchantDetailRecord | null> {
+        const { data, error } = await this.supabaseService
+            .getClient()
+            .from('merchants')
+            .select('*')
+            .eq('wallet', wallet)
+            .single();
+
+        if (error) {
+            if (error.code === 'PGRST116') {
+                return null; // Not found
+            }
+            throw new InternalServerErrorException({
+                code: 'DATABASE_QUERY_ERROR',
+                message: error.message,
+            });
+        }
+
+        return data as MerchantDetailRecord;
     }
 }

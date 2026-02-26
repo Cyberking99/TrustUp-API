@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { MerchantsService } from '../../../../src/modules/merchants/merchants.service';
 import { MerchantsRepository } from '../../../../src/database/repositories/merchants.repository';
+import { NotFoundException } from '@nestjs/common';
 
 describe('MerchantsService', () => {
     let service: MerchantsService;
@@ -9,7 +10,7 @@ describe('MerchantsService', () => {
     const activeMerchants = [
         {
             id: 'merchant-1',
-            wallet: 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLM',
+            wallet: 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNXX',
             name: 'TechStore',
             logo: 'https://example.com/tech-logo.png',
             category: 'Electronics',
@@ -25,8 +26,23 @@ describe('MerchantsService', () => {
         },
     ];
 
+    const mockMerchantDetail = {
+        id: 'merchant-1',
+        wallet: 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNXX',
+        name: 'TechStore',
+        logo: 'https://example.com/tech-logo.png',
+        description: 'Electronics retailer',
+        category: 'Electronics',
+        website: 'https://techstore.com',
+        is_active: true,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-02T00:00:00Z',
+    };
+
     const mockMerchantsRepository = {
         findAll: jest.fn(),
+        findById: jest.fn(),
+        findByWallet: jest.fn(),
     };
 
     beforeEach(async () => {
@@ -62,7 +78,7 @@ describe('MerchantsService', () => {
                 merchants: [
                     {
                         id: 'merchant-1',
-                        wallet: 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLM',
+                        wallet: 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNXX',
                         name: 'TechStore',
                         logo: 'https://example.com/tech-logo.png',
                         category: 'Electronics',
@@ -137,6 +153,57 @@ describe('MerchantsService', () => {
 
             expect(result.merchants[0]).toHaveProperty('isActive', true);
             expect(result.merchants[0]).not.toHaveProperty('is_active');
+        });
+    });
+
+    describe('getMerchantById', () => {
+        it('should return merchant details when a valid UUID is provided', async () => {
+            mockMerchantsRepository.findById.mockResolvedValue(mockMerchantDetail);
+
+            const result = await service.getMerchantById('merchant-1');
+
+            expect(repository.findById).toHaveBeenCalledWith('merchant-1');
+            expect(repository.findByWallet).not.toHaveBeenCalled();
+            expect(result).toEqual({
+                id: mockMerchantDetail.id,
+                wallet: mockMerchantDetail.wallet,
+                name: mockMerchantDetail.name,
+                logo: mockMerchantDetail.logo,
+                description: mockMerchantDetail.description,
+                category: mockMerchantDetail.category,
+                website: mockMerchantDetail.website,
+                isActive: mockMerchantDetail.is_active,
+                createdAt: mockMerchantDetail.created_at,
+                updatedAt: mockMerchantDetail.updated_at,
+            });
+        });
+
+        it('should return merchant details when a valid Stellar wallet is provided', async () => {
+            mockMerchantsRepository.findByWallet.mockResolvedValue(mockMerchantDetail);
+
+            const wallet = 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNXX';
+            const result = await service.getMerchantById(wallet);
+
+            expect(repository.findByWallet).toHaveBeenCalledWith(wallet);
+            expect(repository.findById).not.toHaveBeenCalled();
+            expect(result.id).toEqual(mockMerchantDetail.id);
+        });
+
+        it('should throw NotFoundException if merchant is not found by ID', async () => {
+            mockMerchantsRepository.findById.mockResolvedValue(null);
+
+            await expect(service.getMerchantById('invalid-id')).rejects.toThrow(
+                NotFoundException,
+            );
+        });
+
+        it('should throw NotFoundException if merchant is not found by wallet', async () => {
+            mockMerchantsRepository.findByWallet.mockResolvedValue(null);
+
+            const wallet = 'GMER1ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890ABCDEFGHIJKLMNXX';
+            await expect(service.getMerchantById(wallet)).rejects.toThrow(
+                NotFoundException,
+            );
         });
     });
 });
