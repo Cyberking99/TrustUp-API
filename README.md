@@ -300,26 +300,26 @@ This project is licensed under the MIT License - see the [LICENSE](./LICENSE) fi
 <tr>
 
 <td align="center">
-  <a href="https://github.com/Yusufolosun">
-    <img src="https://avatars.githubusercontent.com/u/175801072?v=4" width="100px;" style="border-radius:50%;" alt="Yusufolosun"/><br />
-    <sub><b>🥇 @Yusufolosun</b></sub><br />
-    <sub>8 contributions</sub>
+  <a href="https://github.com/BrayanMQ">
+    <img src="https://avatars.githubusercontent.com/u/49928451?v=4" width="100px;" style="border-radius:50%;" alt="BrayanMQ"/><br />
+    <sub><b>🥇 @BrayanMQ</b></sub><br />
+    <sub>16 contributions</sub>
   </a>
 </td>
 
 <td align="center">
-  <a href="https://github.com/KevinMB0220">
-    <img src="https://avatars.githubusercontent.com/u/130603817?v=4" width="100px;" style="border-radius:50%;" alt="KevinMB0220"/><br />
-    <sub><b>🥈 @KevinMB0220</b></sub><br />
-    <sub>6 contributions</sub>
+  <a href="https://github.com/Jopsan-gm">
+    <img src="https://avatars.githubusercontent.com/u/228767027?v=4" width="100px;" style="border-radius:50%;" alt="Jopsan-gm"/><br />
+    <sub><b>🥈 @Jopsan-gm</b></sub><br />
+    <sub>11 contributions</sub>
   </a>
 </td>
 
 <td align="center">
-  <a href="https://github.com/Benalex8797">
-    <img src="https://avatars.githubusercontent.com/u/198606778?v=4" width="100px;" style="border-radius:50%;" alt="Benalex8797"/><br />
-    <sub><b>🥉 @Benalex8797</b></sub><br />
-    <sub>5 contributions</sub>
+  <a href="https://github.com/DiegoERS">
+    <img src="https://avatars.githubusercontent.com/u/116531524?v=4" width="100px;" style="border-radius:50%;" alt="DiegoERS"/><br />
+    <sub><b>🥉 @DiegoERS</b></sub><br />
+    <sub>9 contributions</sub>
   </a>
 </td>
 
