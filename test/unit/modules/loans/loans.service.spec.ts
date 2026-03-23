@@ -1,8 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { LoansService } from '../../../../src/modules/loans/loans.service';
 import { ReputationService } from '../../../../src/modules/reputation/reputation.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
+import { CreditLineContractClient } from '../../../../src/blockchain/contracts/credit-line-contract.client';
 
 describe('LoansService', () => {
   let service: LoansService;
@@ -11,13 +12,14 @@ describe('LoansService', () => {
   const merchantId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 
   const mockReputationService = {
-    getReputationScore: jest.fn(),
+    getReputationData: jest.fn(),
   };
 
   const mockSupabaseFrom = {
     select: jest.fn().mockReturnThis(),
     eq: jest.fn().mockReturnThis(),
     single: jest.fn(),
+    insert: jest.fn(),
   };
 
   const mockSupabaseClient = {
@@ -28,12 +30,17 @@ describe('LoansService', () => {
     getServiceRoleClient: jest.fn().mockReturnValue(mockSupabaseClient),
   };
 
+  const mockCreditLineContractClient = {
+    buildCreateLoanTransaction: jest.fn(),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LoansService,
         { provide: ReputationService, useValue: mockReputationService },
         { provide: SupabaseService, useValue: mockSupabaseService },
+        { provide: CreditLineContractClient, useValue: mockCreditLineContractClient },
       ],
     }).compile();
 
@@ -44,6 +51,8 @@ describe('LoansService', () => {
     mockSupabaseClient.from.mockReturnValue(mockSupabaseFrom);
     mockSupabaseFrom.select.mockReturnThis();
     mockSupabaseFrom.eq.mockReturnThis();
+    mockSupabaseFrom.insert.mockResolvedValue({ error: null });
+    mockCreditLineContractClient.buildCreateLoanTransaction.mockResolvedValue('AAAAAgAAAAC...');
   });
 
   afterEach(() => {
@@ -61,7 +70,7 @@ describe('LoansService', () => {
     const baseDto = { amount: 500, merchant: merchantId, term: 4 };
 
     function mockReputation(score: number, tier: string, interestRate: number, maxCredit: number) {
-      mockReputationService.getReputationScore.mockResolvedValue({
+      mockReputationService.getReputationData.mockResolvedValue({
         wallet: validWallet,
         score,
         tier,
@@ -209,6 +218,85 @@ describe('LoansService', () => {
       expect(result.guarantee).toBeCloseTo(66.6, 1);
       expect(result.loanAmount).toBeCloseTo(266.4, 1);
       expect(result.totalRepayment).toBeGreaterThan(result.loanAmount);
+    });
+  });
+
+  describe('createLoan', () => {
+    const baseDto = { amount: 500, merchant: merchantId, term: 4 };
+
+    function mockReputation(score: number, tier: string, interestRate: number, maxCredit: number) {
+      mockReputationService.getReputationData.mockResolvedValue({
+        wallet: validWallet,
+        score,
+        tier,
+        interestRate,
+        maxCredit,
+        lastUpdated: '2026-02-13T10:00:00.000Z',
+      });
+    }
+
+    function mockMerchantFound(isActive = true) {
+      mockSupabaseFrom.single.mockResolvedValue({
+        data: { id: merchantId, name: 'TechStore', is_active: isActive },
+        error: null,
+      });
+    }
+
+    it('should create a pending loan with XDR and terms', async () => {
+      mockReputation(75, 'silver', 8, 2000);
+      mockMerchantFound();
+
+      const result = await service.createLoan(validWallet, baseDto);
+
+      expect(result.loanId).toContain('pending-');
+      expect(result.xdr).toBe('AAAAAgAAAAC...');
+      expect(result.description).toBe('Create BNPL loan for $500 at TechStore');
+      expect(result.terms.guarantee).toBe(100);
+      expect(mockCreditLineContractClient.buildCreateLoanTransaction).toHaveBeenCalled();
+      expect(mockSupabaseClient.from).toHaveBeenCalledWith('loans');
+      expect(mockSupabaseFrom.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_wallet: validWallet,
+          merchant_id: merchantId,
+          status: 'pending',
+          next_payment_due: expect.any(String),
+        }),
+      );
+    });
+
+    it('should reject loan creation when reputation is below minimum threshold', async () => {
+      mockReputation(59, 'poor', 12, 500);
+      mockMerchantFound();
+
+      await expect(service.createLoan(validWallet, { ...baseDto, amount: 200 })).rejects.toMatchObject(
+        {
+          response: { code: 'LOAN_REPUTATION_TOO_LOW' },
+        },
+      );
+    });
+
+    it('should throw InternalServerErrorException when XDR construction fails', async () => {
+      mockReputation(75, 'silver', 8, 2000);
+      mockMerchantFound();
+      mockCreditLineContractClient.buildCreateLoanTransaction.mockRejectedValue(
+        new Error('Soroban unavailable'),
+      );
+
+      await expect(service.createLoan(validWallet, baseDto)).rejects.toThrow(
+        InternalServerErrorException,
+      );
+    });
+
+    it('should throw InternalServerErrorException when pending loan persistence fails', async () => {
+      mockReputation(75, 'silver', 8, 2000);
+      mockMerchantFound();
+      mockSupabaseFrom.insert.mockResolvedValue({
+        error: { message: 'insert failed' },
+      });
+
+      await expect(service.createLoan(validWallet, baseDto)).rejects.toThrow(
+        InternalServerErrorException,
+      );
     });
   });
 

@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { LoansController } from '../../../../src/modules/loans/loans.controller';
 import { LoansService } from '../../../../src/modules/loans/loans.service';
+import { CreateLoanResponseDto } from '../../../../src/modules/loans/dto/create-loan-response.dto';
 
 describe('LoansController', () => {
   let controller: LoansController;
@@ -26,6 +27,14 @@ describe('LoansController', () => {
 
   const mockLoansService = {
     calculateLoanQuote: jest.fn(),
+    createLoan: jest.fn(),
+  };
+
+  const mockCreateLoanResponse: CreateLoanResponseDto = {
+    loanId: 'pending-1711180800000-ab12cd34',
+    xdr: 'AAAAAgAAAAC...',
+    description: 'Create BNPL loan for $500 at TechStore',
+    terms: mockQuoteResponse,
   };
 
   beforeEach(async () => {
@@ -117,6 +126,42 @@ describe('LoansController', () => {
       await expect(
         controller.getLoanQuote(validWallet, validDto),
       ).rejects.toThrow('Reputation fetch failed');
+    });
+  });
+
+  describe('createLoan', () => {
+    const validDto = {
+      amount: 500,
+      merchant: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      term: 4,
+    };
+
+    it('should return a created loan response wrapped in response envelope', async () => {
+      mockLoansService.createLoan.mockResolvedValue(mockCreateLoanResponse);
+
+      const result = await controller.createLoan(validWallet, validDto);
+
+      expect(result).toEqual({
+        success: true,
+        data: mockCreateLoanResponse,
+        message: 'Pending loan created successfully',
+      });
+      expect(loansService.createLoan).toHaveBeenCalledWith(validWallet, validDto);
+      expect(loansService.createLoan).toHaveBeenCalledTimes(1);
+    });
+
+    it('should throw BadRequestException for invalid wallet format', async () => {
+      await expect(controller.createLoan('INVALID_WALLET', validDto)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('should propagate service errors to the caller', async () => {
+      mockLoansService.createLoan.mockRejectedValue(new Error('XDR construction failed'));
+
+      await expect(controller.createLoan(validWallet, validDto)).rejects.toThrow(
+        'XDR construction failed',
+      );
     });
   });
 });
