@@ -3,17 +3,39 @@ import {
   BadRequestException,
   NotFoundException,
   Logger,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { ReputationService } from '../reputation/reputation.service';
 import { SupabaseService } from '../../database/supabase.client';
 import { LoanQuoteRequestDto } from './dto/loan-quote-request.dto';
 import { LoanQuoteResponseDto, SchedulePaymentDto } from './dto/loan-quote-response.dto';
+import { CreateLoanResponseDto } from './dto/create-loan-response.dto';
+import { CreditLineContractClient } from '../../blockchain/contracts/credit-line-contract.client';
 
-/** Guarantee percentage of the total purchase amount */
 const GUARANTEE_PERCENT = 0.2;
-
-/** Loan percentage of the total purchase amount (1 - guarantee) */
 const LOAN_PERCENT = 0.8;
+const MIN_LOAN_REPUTATION_SCORE = 60;
+
+interface ValidMerchant {
+  id: string;
+  name: string;
+  is_active: boolean;
+}
+
+interface CreateLoanRecord {
+  loan_id: string;
+  user_wallet: string;
+  merchant_id: string;
+  amount: number;
+  loan_amount: number;
+  guarantee: number;
+  interest_rate: number;
+  total_repayment: number;
+  remaining_balance: number;
+  term: number;
+  status: 'pending';
+  next_payment_due: string | null;
+}
 
 @Injectable()
 export class LoansService {
@@ -22,33 +44,87 @@ export class LoansService {
   constructor(
     private readonly reputationService: ReputationService,
     private readonly supabaseService: SupabaseService,
+    private readonly creditLineContractClient: CreditLineContractClient,
   ) {}
 
-  /**
-   * Calculates a loan quote based on the user's reputation score and the
-   * requested amount/term. No blockchain interaction — purely off-chain math.
-   *
-   * Steps:
-   * 1. Fetch the user's reputation (score, tier, interest rate, max credit)
-   * 2. Validate the merchant exists and is active
-   * 3. Validate the amount is within the user's credit limit
-   * 4. Calculate guarantee, loan amount, interest, and total repayment
-   * 5. Generate a monthly repayment schedule
-   *
-   * @param wallet - Stellar wallet address of the borrower
-   * @param dto    - Loan quote request (amount, merchant, term)
-   */
   async calculateLoanQuote(
     wallet: string,
     dto: LoanQuoteRequestDto,
   ): Promise<LoanQuoteResponseDto> {
-    // 1. Fetch reputation to determine interest rate and credit limit
-    const reputation = await this.reputationService.getReputationScore(wallet);
+    const { terms } = await this.prepareLoanPreview(wallet, dto, false);
+    return terms;
+  }
 
-    // 2. Validate merchant exists and is active
-    await this.validateMerchant(dto.merchant);
+  async createLoan(wallet: string, dto: LoanQuoteRequestDto): Promise<CreateLoanResponseDto> {
+    const { merchant, terms } = await this.prepareLoanPreview(wallet, dto, true);
+    const loanId = this.generateProvisionalLoanId();
+    const description = `Create BNPL loan for $${dto.amount} at ${merchant.name}`;
 
-    // 3. Validate amount against user's max credit
+    let xdr: string;
+    try {
+      xdr = await this.creditLineContractClient.buildCreateLoanTransaction(wallet, {
+        loanId,
+        merchantId: merchant.id,
+        amount: dto.amount,
+        loanAmount: terms.loanAmount,
+        guarantee: terms.guarantee,
+        interestRate: terms.interestRate,
+        term: terms.term,
+      });
+    } catch (error) {
+      this.logger.error(`Failed to build create_loan XDR for ${loanId}: ${error.message}`);
+      throw new InternalServerErrorException({
+        code: 'BLOCKCHAIN_CREATE_LOAN_XDR_FAILED',
+        message: 'Failed to construct unsigned loan transaction. Please try again.',
+      });
+    }
+
+    try {
+      await this.persistPendingLoan({
+        loan_id: loanId,
+        user_wallet: wallet,
+        merchant_id: merchant.id,
+        amount: terms.amount,
+        loan_amount: terms.loanAmount,
+        guarantee: terms.guarantee,
+        interest_rate: terms.interestRate,
+        total_repayment: terms.totalRepayment,
+        remaining_balance: terms.totalRepayment,
+        term: terms.term,
+        status: 'pending',
+        next_payment_due: terms.schedule[0]?.dueDate ?? null,
+      });
+    } catch (error) {
+      this.logger.error(`Failed to persist pending loan ${loanId}: ${error.message}`);
+      throw new InternalServerErrorException({
+        code: 'DATABASE_CREATE_LOAN_FAILED',
+        message: 'Failed to persist pending loan record. Please try again.',
+      });
+    }
+
+    return {
+      loanId,
+      xdr,
+      description,
+      terms,
+    };
+  }
+
+  private async prepareLoanPreview(
+    wallet: string,
+    dto: LoanQuoteRequestDto,
+    enforceMinimumReputation: boolean,
+  ): Promise<{ merchant: ValidMerchant; terms: LoanQuoteResponseDto }> {
+    const reputation = await this.reputationService.getReputationData(wallet);
+    const merchant = await this.validateMerchant(dto.merchant);
+
+    if (enforceMinimumReputation && reputation.score < MIN_LOAN_REPUTATION_SCORE) {
+      throw new BadRequestException({
+        code: 'LOAN_REPUTATION_TOO_LOW',
+        message: `Minimum reputation score to create a loan is ${MIN_LOAN_REPUTATION_SCORE}. Your current score is ${reputation.score}.`,
+      });
+    }
+
     if (dto.amount > reputation.maxCredit) {
       throw new BadRequestException({
         code: 'LOAN_AMOUNT_EXCEEDS_CREDIT',
@@ -56,37 +132,29 @@ export class LoansService {
       });
     }
 
-    // 4. Calculate loan breakdown
     const guarantee = Math.round(dto.amount * GUARANTEE_PERCENT * 100) / 100;
     const loanAmount = Math.round(dto.amount * LOAN_PERCENT * 100) / 100;
     const interestRate = reputation.interestRate;
-
-    // Interest = principal × (rate/100) × (term/12)
     const interest = loanAmount * (interestRate / 100) * (dto.term / 12);
     const totalRepayment = Math.round((loanAmount + interest) * 100) / 100;
-
-    // 5. Generate repayment schedule
     const schedule = this.generateSchedule(totalRepayment, dto.term);
 
     return {
-      amount: dto.amount,
-      guarantee,
-      loanAmount,
-      interestRate,
-      totalRepayment,
-      term: dto.term,
-      schedule,
+      merchant,
+      terms: {
+        amount: dto.amount,
+        guarantee,
+        loanAmount,
+        interestRate,
+        totalRepayment,
+        term: dto.term,
+        schedule,
+      },
     };
   }
 
-  /**
-   * Validates that a merchant exists in the database and is currently active.
-   * Throws NotFoundException if the merchant doesn't exist, or
-   * BadRequestException if the merchant is inactive.
-   */
-  private async validateMerchant(merchantId: string): Promise<void> {
+  private async validateMerchant(merchantId: string): Promise<ValidMerchant> {
     const client = this.supabaseService.getServiceRoleClient();
-
     const { data: merchant, error } = await client
       .from('merchants')
       .select('id, name, is_active')
@@ -106,16 +174,23 @@ export class LoansService {
         message: `Merchant "${merchant.name}" is not currently accepting new loans.`,
       });
     }
+
+    return merchant;
   }
 
-  /**
-   * Generates an equal-payment monthly repayment schedule.
-   * The last payment absorbs any rounding remainder so the sum
-   * of all payments equals totalRepayment exactly.
-   *
-   * @param totalRepayment - Total amount to be repaid
-   * @param term           - Number of monthly payments
-   */
+  private generateProvisionalLoanId(): string {
+    return `pending-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  private async persistPendingLoan(record: CreateLoanRecord): Promise<void> {
+    const client = this.supabaseService.getServiceRoleClient();
+    const { error } = await client.from('loans').insert(record);
+
+    if (error) {
+      throw new Error(error.message ?? 'Supabase insert failed');
+    }
+  }
+
   generateSchedule(totalRepayment: number, term: number): SchedulePaymentDto[] {
     const monthlyPayment = Math.floor((totalRepayment / term) * 100) / 100;
     const now = new Date();
