@@ -12,7 +12,7 @@ describe('LoansController (e2e)', () => {
   let app: NestFastifyApplication;
 
   const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
-  const merchantId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+  const merchantId = 'a1b2c3d4-e5f6-4890-abcd-ef1234567890';
 
   const mockCreditLineContract = {
     buildCreateLoanTransaction: jest.fn().mockResolvedValue('AAAAAgAAAAC...'),
