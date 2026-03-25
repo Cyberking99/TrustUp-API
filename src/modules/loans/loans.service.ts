@@ -6,8 +6,11 @@ import {
 } from '@nestjs/common';
 import { ReputationService } from '../reputation/reputation.service';
 import { SupabaseService } from '../../database/supabase.client';
+import { CreditLineContractClient } from '../../blockchain/contracts/credit-line-contract.client';
 import { LoanQuoteRequestDto } from './dto/loan-quote-request.dto';
 import { LoanQuoteResponseDto, SchedulePaymentDto } from './dto/loan-quote-response.dto';
+import { LoanPaymentRequestDto } from './dto/loan-payment-request.dto';
+import { LoanPaymentResponseDto } from './dto/loan-payment-response.dto';
 
 /** Guarantee percentage of the total purchase amount */
 const GUARANTEE_PERCENT = 0.2;
@@ -22,6 +25,7 @@ export class LoansService {
   constructor(
     private readonly reputationService: ReputationService,
     private readonly supabaseService: SupabaseService,
+    private readonly creditLineClient: CreditLineContractClient,
   ) {}
 
   /**
@@ -76,6 +80,93 @@ export class LoansService {
       totalRepayment,
       term: dto.term,
       schedule,
+    };
+  }
+
+  /**
+   * Processes a loan repayment request. Validates the loan and payment amount,
+   * constructs an unsigned Soroban repay_loan() transaction, and returns it
+   * alongside a payment preview for the mobile app to review before signing.
+   *
+   * Steps:
+   * 1. Fetch the loan from the database by loanId
+   * 2. Validate the loan exists and belongs to the authenticated user
+   * 3. Validate the loan is in 'active' status
+   * 4. Validate the payment amount is within the remaining balance
+   * 5. Build an unsigned repay_loan() XDR transaction via the contract client
+   * 6. Calculate the new remaining balance and determine if the loan will complete
+   * 7. Return the unsigned XDR and payment preview
+   *
+   * @param wallet  - Authenticated borrower's Stellar wallet address
+   * @param loanId  - UUID of the loan record in the database
+   * @param dto     - Payment request containing the amount
+   */
+  async repayLoan(
+    wallet: string,
+    loanId: string,
+    dto: LoanPaymentRequestDto,
+  ): Promise<LoanPaymentResponseDto> {
+    const client = this.supabaseService.getServiceRoleClient();
+
+    // 1. Fetch loan from database
+    const { data: loan, error } = await client
+      .from('loans')
+      .select('id, loan_id, user_wallet, status, remaining_balance')
+      .eq('id', loanId)
+      .single();
+
+    if (error || !loan) {
+      throw new NotFoundException({
+        code: 'LOAN_NOT_FOUND',
+        message: 'Loan not found. Please provide a valid loan ID.',
+      });
+    }
+
+    // 2. Verify loan ownership
+    if (loan.user_wallet !== wallet) {
+      throw new NotFoundException({
+        code: 'LOAN_NOT_FOUND',
+        message: 'Loan not found. Please provide a valid loan ID.',
+      });
+    }
+
+    // 3. Validate loan status is active
+    if (loan.status !== 'active') {
+      throw new BadRequestException({
+        code: 'LOAN_NOT_ACTIVE',
+        message: `Cannot make payments on a loan with status '${loan.status}'. Only active loans can be repaid.`,
+      });
+    }
+
+    const remainingBalance = Number(loan.remaining_balance);
+
+    // 4. Validate payment amount does not exceed remaining balance
+    if (dto.amount > remainingBalance) {
+      throw new BadRequestException({
+        code: 'LOAN_PAYMENT_EXCEEDS_BALANCE',
+        message: `Payment amount $${dto.amount} exceeds the remaining balance of $${remainingBalance}.`,
+      });
+    }
+
+    // 5. Build unsigned repay_loan() Soroban transaction
+    const unsignedXdr = await this.creditLineClient.buildRepayLoanTx(
+      wallet,
+      loan.loan_id,
+      dto.amount,
+    );
+
+    // 6. Calculate new balance and completion flag
+    const newBalance = Math.round((remainingBalance - dto.amount) * 10_000_000) / 10_000_000;
+    const willComplete = newBalance === 0;
+
+    return {
+      unsignedXdr,
+      preview: {
+        paymentAmount: dto.amount,
+        currentBalance: remainingBalance,
+        newBalance,
+        willComplete,
+      },
     };
   }
 
