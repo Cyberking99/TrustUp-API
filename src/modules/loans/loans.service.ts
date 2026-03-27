@@ -179,7 +179,7 @@ export class LoansService {
     dto: LoanQuoteRequestDto,
     enforceMinimumReputation: boolean,
   ): Promise<{ merchant: ValidMerchant; terms: LoanQuoteResponseDto }> {
-    const reputation = await this.reputationService.getReputationData(wallet);
+    const reputation = await this.reputationService.getReputationScore(wallet);
     const merchant = await this.validateMerchant(dto.merchant);
 
     if (enforceMinimumReputation && reputation.score < MIN_LOAN_REPUTATION_SCORE) {

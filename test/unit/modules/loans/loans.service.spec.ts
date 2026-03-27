@@ -16,7 +16,7 @@ describe('LoansService', () => {
   const merchantId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 
   const mockReputationService = {
-    getReputationData: jest.fn(),
+    getReputationScore: jest.fn(),
   };
 
   const mockSupabaseFrom = {
@@ -72,7 +72,7 @@ describe('LoansService', () => {
     const baseDto = { amount: 500, merchant: merchantId, term: 4 };
 
     function mockReputation(score: number, tier: string, interestRate: number, maxCredit: number) {
-      mockReputationService.getReputationData.mockResolvedValue({
+      mockReputationService.getReputationScore.mockResolvedValue({
         wallet: validWallet,
         score,
         tier,
@@ -219,7 +219,7 @@ describe('LoansService', () => {
     const baseDto = { amount: 500, merchant: merchantId, term: 4 };
 
     function mockReputation(score: number, tier: string, interestRate: number, maxCredit: number) {
-      mockReputationService.getReputationData.mockResolvedValue({
+      mockReputationService.getReputationScore.mockResolvedValue({
         wallet: validWallet,
         score,
         tier,

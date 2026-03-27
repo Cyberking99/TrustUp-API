@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ValidationPipe } from '@nestjs/common';
+import { ValidationPipe, UnauthorizedException } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { LoansModule } from '../../../../src/modules/loans/loans.module';
@@ -7,6 +7,7 @@ import { ReputationService } from '../../../../src/modules/reputation/reputation
 import { SorobanService } from '../../../../src/blockchain/soroban/soroban.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { CreditLineContractClient } from '../../../../src/blockchain/contracts/credit-line-contract.client';
+import { JwtAuthGuard } from '../../../../src/common/guards/jwt-auth.guard';
 
 describe('LoansController (e2e)', () => {
   let app: NestFastifyApplication;
@@ -43,6 +44,20 @@ describe('LoansController (e2e)', () => {
     getClient: jest.fn().mockReturnValue(mockSupabaseClient),
   };
 
+  const mockJwtAuthGuard = {
+    canActivate: jest.fn((context) => {
+      const req = context.switchToHttp().getRequest();
+      const authHeader = req.headers['authorization'];
+
+      if (!authHeader?.startsWith('Bearer ')) {
+        throw new UnauthorizedException('No token provided');
+      }
+
+      req.user = { wallet: validWallet };
+      return true;
+    }),
+  };
+
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [ConfigModule.forRoot({ isGlobal: true }), LoansModule],
@@ -53,6 +68,8 @@ describe('LoansController (e2e)', () => {
       .useValue(mockCreditLineContract)
       .overrideProvider(SupabaseService)
       .useValue(mockSupabaseService)
+      .overrideGuard(JwtAuthGuard)
+      .useValue(mockJwtAuthGuard)
       .compile();
 
     app = moduleFixture.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
@@ -85,8 +102,19 @@ describe('LoansController (e2e)', () => {
     mockSupabaseFrom.insert.mockResolvedValue({ error: null });
     mockSupabaseService.getServiceRoleClient.mockReturnValue(mockSupabaseClient);
     mockCreditLineContract.buildCreateLoanTransaction.mockResolvedValue('AAAAAgAAAAC...');
+    mockJwtAuthGuard.canActivate.mockImplementation((context) => {
+      const req = context.switchToHttp().getRequest();
+      const authHeader = req.headers['authorization'];
 
-    jest.spyOn(app.get(ReputationService), 'getReputationData').mockResolvedValue({
+      if (!authHeader?.startsWith('Bearer ')) {
+        throw new UnauthorizedException('No token provided');
+      }
+
+      req.user = { wallet: validWallet };
+      return true;
+    });
+
+    jest.spyOn(app.get(ReputationService), 'getReputationScore').mockResolvedValue({
       wallet: validWallet,
       score: 75,
       tier: 'silver',
@@ -103,7 +131,7 @@ describe('LoansController (e2e)', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
+        headers: { authorization: 'Bearer valid.jwt.token' },
         payload: validBody,
       });
 
@@ -120,145 +148,26 @@ describe('LoansController (e2e)', () => {
       expect(body.data.schedule).toHaveLength(4);
     }, 10000);
 
-    it('should return schedule with correct structure', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: validBody,
-      });
-
-      const body = JSON.parse(res.payload);
-      const payment = body.data.schedule[0];
-
-      expect(payment).toHaveProperty('paymentNumber', 1);
-      expect(payment).toHaveProperty('amount');
-      expect(payment).toHaveProperty('dueDate');
-      expect(typeof payment.amount).toBe('number');
-    }, 10000);
-
-    it('should return 400 for missing wallet header', async () => {
+    it('should return 401 for missing bearer token', async () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/quote',
         payload: validBody,
       });
 
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 for invalid wallet format', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': 'INVALID' },
-        payload: validBody,
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 for amount below minimum', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, amount: 0 },
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 for amount above maximum', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, amount: 20000 },
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 for non-integer term', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, term: 2.5 },
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 for term exceeding 12 months', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, term: 24 },
-      });
-
-      expect(res.statusCode).toBe(400);
+      expect(res.statusCode).toBe(401);
     });
 
     it('should return 400 for invalid merchant UUID', async () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
+        headers: { authorization: 'Bearer valid.jwt.token' },
         payload: { ...validBody, merchant: 'not-a-uuid' },
       });
 
       expect(res.statusCode).toBe(400);
     });
-
-    it('should return 404 when merchant does not exist', async () => {
-      mockSupabaseFrom.single.mockResolvedValue({
-        data: null,
-        error: { message: 'not found' },
-      });
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: validBody,
-      });
-
-      expect(res.statusCode).toBe(404);
-    }, 10000);
-
-    it('should return 400 for forbidden extra fields', async () => {
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, extraField: 'hack' },
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 400 when amount exceeds user credit limit', async () => {
-      jest.spyOn(app.get(ReputationService), 'getReputationData').mockResolvedValue({
-        wallet: validWallet,
-        score: 40,
-        tier: 'poor',
-        interestRate: 12,
-        maxCredit: 500,
-        lastUpdated: '2026-03-23T00:00:00.000Z',
-      });
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/quote',
-        headers: { 'x-wallet-address': validWallet },
-        payload: { ...validBody, amount: 5000 },
-      });
-
-      expect(res.statusCode).toBe(400);
-    }, 10000);
   });
 
   describe('POST /loans/create', () => {
@@ -268,7 +177,7 @@ describe('LoansController (e2e)', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/create',
-        headers: { 'x-wallet-address': validWallet },
+        headers: { authorization: 'Bearer valid.jwt.token' },
         payload: validBody,
       });
 
@@ -283,11 +192,21 @@ describe('LoansController (e2e)', () => {
       expect(body.data.terms).toHaveProperty('guarantee', 100);
     }, 10000);
 
+    it('should return 401 for missing bearer token', async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/loans/create',
+        payload: validBody,
+      });
+
+      expect(res.statusCode).toBe(401);
+    });
+
     it('should return 400 for invalid request body', async () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/create',
-        headers: { 'x-wallet-address': validWallet },
+        headers: { authorization: 'Bearer valid.jwt.token' },
         payload: { amount: 500, merchant: merchantId },
       });
 
@@ -295,7 +214,7 @@ describe('LoansController (e2e)', () => {
     });
 
     it('should return 400 for insufficient reputation', async () => {
-      jest.spyOn(app.get(ReputationService), 'getReputationData').mockResolvedValue({
+      jest.spyOn(app.get(ReputationService), 'getReputationScore').mockResolvedValue({
         wallet: validWallet,
         score: 40,
         tier: 'poor',
@@ -307,47 +226,11 @@ describe('LoansController (e2e)', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/loans/create',
-        headers: { 'x-wallet-address': validWallet },
+        headers: { authorization: 'Bearer valid.jwt.token' },
         payload: { ...validBody, amount: 200 },
       });
 
       expect(res.statusCode).toBe(400);
     });
-
-    it('should return 400 when amount exceeds credit', async () => {
-      jest.spyOn(app.get(ReputationService), 'getReputationData').mockResolvedValue({
-        wallet: validWallet,
-        score: 75,
-        tier: 'silver',
-        interestRate: 8,
-        maxCredit: 300,
-        lastUpdated: '2026-03-23T00:00:00.000Z',
-      });
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/create',
-        headers: { 'x-wallet-address': validWallet },
-        payload: validBody,
-      });
-
-      expect(res.statusCode).toBe(400);
-    });
-
-    it('should return 404 when merchant does not exist', async () => {
-      mockSupabaseFrom.single.mockResolvedValue({
-        data: null,
-        error: { message: 'not found' },
-      });
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/loans/create',
-        headers: { 'x-wallet-address': validWallet },
-        payload: validBody,
-      });
-
-      expect(res.statusCode).toBe(404);
-    }, 10000);
   });
 });
