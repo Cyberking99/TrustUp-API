@@ -1,17 +1,29 @@
-import { Test, TestingModule } from "@nestjs/testing";
-import { BadRequestException, HttpException } from "@nestjs/common";
-import { LiquidityService } from "../../../../src/modules/liquidity/liquidity.service";
-import { LiquidityContractClient } from "../../../../src/blockchain/contracts/liquidity-contract.client";
+import { Test, TestingModule } from '@nestjs/testing';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { BadRequestException, HttpException } from '@nestjs/common';
+import { LiquidityService } from '../../../../src/modules/liquidity/liquidity.service';
+import { LiquidityContractClient } from '../../../../src/blockchain/contracts/liquidity-contract.client';
+import { SupabaseService } from '../../../../src/database/supabase.client';
 
-describe("LiquidityService", () => {
+describe('LiquidityService', () => {
   let service: LiquidityService;
 
-  const validWallet =
-    "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW";
+  const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
+  const STROOPS = 10_000_000n;
+
+  const mockCacheManager = {
+    get: jest.fn(),
+    set: jest.fn(),
+  };
+
+  const mockSupabaseService = {
+    getServiceRoleClient: jest.fn(),
+  };
 
   const mockLiquidityContractClient = {
-    getProviderShares: jest.fn(),
-    getPoolSnapshot: jest.fn(),
+    getLpShares: jest.fn(),
+    getPoolStats: jest.fn(),
+    calculateWithdrawal: jest.fn(),
     buildWithdrawTx: jest.fn(),
   };
 
@@ -19,10 +31,9 @@ describe("LiquidityService", () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LiquidityService,
-        {
-          provide: LiquidityContractClient,
-          useValue: mockLiquidityContractClient,
-        },
+        { provide: CACHE_MANAGER, useValue: mockCacheManager },
+        { provide: SupabaseService, useValue: mockSupabaseService },
+        { provide: LiquidityContractClient, useValue: mockLiquidityContractClient },
       ],
     }).compile();
 
@@ -30,30 +41,29 @@ describe("LiquidityService", () => {
     jest.clearAllMocks();
   });
 
-  it("should be defined", () => {
+  it('should be defined', () => {
     expect(service).toBeDefined();
   });
 
-  describe("withdrawLiquidity", () => {
-    it("should construct an unsigned XDR and preview for a valid partial withdrawal", async () => {
-      mockLiquidityContractClient.getProviderShares.mockResolvedValue(925);
-      mockLiquidityContractClient.getPoolSnapshot.mockResolvedValue({
-        totalLiquidity: 100000,
-        availableLiquidity: 1500,
-        sharePrice: 1.08,
-        withdrawalFeeBps: 50,
+  describe('withdrawLiquidity', () => {
+    it('should construct an unsigned XDR and preview for a valid partial withdrawal', async () => {
+      mockLiquidityContractClient.getLpShares.mockResolvedValue(925n * STROOPS);
+      mockLiquidityContractClient.getPoolStats.mockResolvedValue({
+        totalLiquidity: 100000n * STROOPS,
+        lockedLiquidity: 98500n * STROOPS,
+        availableLiquidity: 1500n * STROOPS,
+        totalShares: 92500n * STROOPS,
+        sharePrice: 10800n,
+        withdrawalFeeBps: 50n,
       });
-      mockLiquidityContractClient.buildWithdrawTx.mockResolvedValue(
-        "AAAAAgAAAAA...",
-      );
+      mockLiquidityContractClient.calculateWithdrawal.mockResolvedValue(540n * STROOPS);
+      mockLiquidityContractClient.buildWithdrawTx.mockResolvedValue('AAAAAgAAAAA...');
 
-      const result = await service.withdrawLiquidity(validWallet, {
-        shares: 500,
-      });
+      const result = await service.withdrawLiquidity(validWallet, { shares: 500 });
 
       expect(result).toEqual({
-        unsignedXdr: "AAAAAgAAAAA...",
-        description: "Withdraw 500 shares from liquidity pool",
+        unsignedXdr: 'AAAAAgAAAAA...',
+        description: 'Withdraw 500 shares from liquidity pool',
         preview: {
           shares: 500,
           ownedShares: 925,
@@ -68,82 +78,78 @@ describe("LiquidityService", () => {
       });
       expect(mockLiquidityContractClient.buildWithdrawTx).toHaveBeenCalledWith(
         validWallet,
-        500,
+        500n * STROOPS,
       );
     });
 
-    it("should reject zero or negative shares before hitting the blockchain client", async () => {
-      await expect(
-        service.withdrawLiquidity(validWallet, { shares: 0 }),
-      ).rejects.toThrow(BadRequestException);
-
-      expect(
-        mockLiquidityContractClient.getProviderShares,
-      ).not.toHaveBeenCalled();
-      expect(
-        mockLiquidityContractClient.getPoolSnapshot,
-      ).not.toHaveBeenCalled();
-    });
-
-    it("should reject withdrawals above the user share balance", async () => {
-      mockLiquidityContractClient.getProviderShares.mockResolvedValue(
-        499.9999999,
+    it('should reject zero or negative shares before hitting the blockchain client', async () => {
+      await expect(service.withdrawLiquidity(validWallet, { shares: 0 })).rejects.toThrow(
+        BadRequestException,
       );
-      mockLiquidityContractClient.getPoolSnapshot.mockResolvedValue({
-        totalLiquidity: 100000,
-        availableLiquidity: 10000,
-        sharePrice: 1.08,
-        withdrawalFeeBps: 0,
+
+      expect(mockLiquidityContractClient.getLpShares).not.toHaveBeenCalled();
+      expect(mockLiquidityContractClient.getPoolStats).not.toHaveBeenCalled();
+    });
+
+    it('should reject withdrawals above the user share balance', async () => {
+      mockLiquidityContractClient.getLpShares.mockResolvedValue(4999999999n);
+      mockLiquidityContractClient.getPoolStats.mockResolvedValue({
+        totalLiquidity: 100000n * STROOPS,
+        lockedLiquidity: 90000n * STROOPS,
+        availableLiquidity: 10000n * STROOPS,
+        totalShares: 100000n * STROOPS,
+        sharePrice: 10800n,
+        withdrawalFeeBps: 0n,
       });
 
-      await expect(
-        service.withdrawLiquidity(validWallet, { shares: 500 }),
-      ).rejects.toMatchObject({
-        response: { code: "LIQUIDITY_INSUFFICIENT_SHARES" },
+      await expect(service.withdrawLiquidity(validWallet, { shares: 500 })).rejects.toMatchObject({
+        response: { code: 'LIQUIDITY_INSUFFICIENT_SHARES' },
       });
     });
 
-    it("should fail gracefully when pool available liquidity is insufficient", async () => {
-      mockLiquidityContractClient.getProviderShares.mockResolvedValue(1000);
-      mockLiquidityContractClient.getPoolSnapshot.mockResolvedValue({
-        totalLiquidity: 100000,
-        availableLiquidity: 400,
-        sharePrice: 1.08,
-        withdrawalFeeBps: 0,
+    it('should fail gracefully when pool available liquidity is insufficient', async () => {
+      mockLiquidityContractClient.getLpShares.mockResolvedValue(1000n * STROOPS);
+      mockLiquidityContractClient.getPoolStats.mockResolvedValue({
+        totalLiquidity: 100000n * STROOPS,
+        lockedLiquidity: 99600n * STROOPS,
+        availableLiquidity: 400n * STROOPS,
+        totalShares: 100000n * STROOPS,
+        sharePrice: 10800n,
+        withdrawalFeeBps: 0n,
       });
+      mockLiquidityContractClient.calculateWithdrawal.mockResolvedValue(540n * STROOPS);
 
-      await expect(
-        service.withdrawLiquidity(validWallet, { shares: 500 }),
-      ).rejects.toThrow(HttpException);
+      await expect(service.withdrawLiquidity(validWallet, { shares: 500 })).rejects.toThrow(
+        HttpException,
+      );
 
       try {
         await service.withdrawLiquidity(validWallet, { shares: 500 });
-        fail("Expected insufficient liquidity error");
+        fail('Expected insufficient liquidity error');
       } catch (error) {
         expect((error as HttpException).getStatus()).toBe(402);
         expect((error as HttpException).getResponse()).toEqual(
           expect.objectContaining({
-            code: "LIQUIDITY_INSUFFICIENT_AVAILABLE_LIQUIDITY",
+            code: 'LIQUIDITY_INSUFFICIENT_AVAILABLE_LIQUIDITY',
           }),
         );
       }
     });
 
-    it("should support zero configured withdrawal fees", async () => {
-      mockLiquidityContractClient.getProviderShares.mockResolvedValue(1000);
-      mockLiquidityContractClient.getPoolSnapshot.mockResolvedValue({
-        totalLiquidity: 100000,
-        availableLiquidity: 10000,
-        sharePrice: 1,
-        withdrawalFeeBps: 0,
+    it('should support zero configured withdrawal fees', async () => {
+      mockLiquidityContractClient.getLpShares.mockResolvedValue(1000n * STROOPS);
+      mockLiquidityContractClient.getPoolStats.mockResolvedValue({
+        totalLiquidity: 100000n * STROOPS,
+        lockedLiquidity: 90000n * STROOPS,
+        availableLiquidity: 10000n * STROOPS,
+        totalShares: 100000n * STROOPS,
+        sharePrice: 10000n,
+        withdrawalFeeBps: 0n,
       });
-      mockLiquidityContractClient.buildWithdrawTx.mockResolvedValue(
-        "AAAAAgAAAAA...",
-      );
+      mockLiquidityContractClient.calculateWithdrawal.mockResolvedValue(2505000000n);
+      mockLiquidityContractClient.buildWithdrawTx.mockResolvedValue('AAAAAgAAAAA...');
 
-      const result = await service.withdrawLiquidity(validWallet, {
-        shares: 250.5,
-      });
+      const result = await service.withdrawLiquidity(validWallet, { shares: 250.5 });
 
       expect(result.preview.expectedAmount).toBe(250.5);
       expect(result.preview.fee).toBe(0);

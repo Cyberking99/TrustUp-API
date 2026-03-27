@@ -1,27 +1,20 @@
-import {
-  Injectable,
-  Logger,
-  ServiceUnavailableException,
-} from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
-import * as StellarSdk from "stellar-sdk";
-import { SorobanService } from "../soroban/soroban.service";
+import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as StellarSdk from 'stellar-sdk';
+import { SorobanService } from '../soroban/soroban.service';
 
-export interface LiquidityPoolSnapshot {
-  totalLiquidity: number;
-  availableLiquidity: number;
-  sharePrice: number;
-  withdrawalFeeBps: number;
+const STROOPS = 10_000_000n;
+const SHARE_PRICE_BPS = 10_000n;
+
+export interface PoolStats {
+  totalLiquidity: bigint;
+  lockedLiquidity: bigint;
+  availableLiquidity: bigint;
+  totalShares: bigint;
+  sharePrice: bigint;
+  withdrawalFeeBps: bigint;
 }
 
-const STROOPS_SCALE = 10_000_000;
-
-/**
- * Contract client for TrustUp's liquidity pool contract.
- *
- * This client keeps blockchain I/O and XDR construction isolated from the
- * LiquidityService, following the architecture docs in `docs/architecture/blockchain-layer.md`.
- */
 @Injectable()
 export class LiquidityContractClient {
   private readonly logger = new Logger(LiquidityContractClient.name);
@@ -32,64 +25,123 @@ export class LiquidityContractClient {
     private readonly configService: ConfigService,
   ) {
     this.contractId =
-      this.configService.get<string>("LIQUIDITY_POOL_CONTRACT_ID") || "";
+      this.configService.get<string>('LIQUIDITY_POOL_CONTRACT_ID') ||
+      this.configService.get<string>('LIQUIDITY_CONTRACT_ID') ||
+      '';
 
     if (this.contractId) {
-      this.logger.log(
-        `Liquidity pool contract loaded: ${this.contractId.slice(0, 8)}...`,
-      );
+      this.logger.log(`Liquidity contract loaded: ${this.contractId.slice(0, 8)}...`);
     } else {
-      this.logger.warn(
-        "LIQUIDITY_POOL_CONTRACT_ID is not set - liquidity contract calls will fail",
-      );
+      this.logger.warn('LIQUIDITY_POOL_CONTRACT_ID is not set - liquidity contract calls will fail');
     }
   }
 
-  async getProviderShares(wallet: string): Promise<number> {
-    const addressArg = StellarSdk.nativeToScVal(
-      StellarSdk.Address.fromString(wallet),
-      {
-        type: "address",
-      },
-    );
+  async getLpShares(wallet: string): Promise<bigint> {
+    this.ensureConfigured();
 
-    return this.readScaledContractNumber(
-      ["get_provider_shares", "provider_shares", "get_shares", "shares_of"],
-      [addressArg],
-      "provider shares",
-    );
+    const addressArg = StellarSdk.nativeToScVal(StellarSdk.Address.fromString(wallet), {
+      type: 'address',
+    });
+
+    try {
+      return await this.readBigInt(
+        ['get_lp_shares', 'get_provider_shares', 'provider_shares', 'get_shares', 'shares_of'],
+        [addressArg],
+        'provider shares',
+        true,
+      );
+    } catch (error) {
+      if (this.isMissingProviderError(error)) {
+        this.logger.debug(`No LP shares for wallet ${wallet.slice(0, 8)}...`);
+        return 0n;
+      }
+      throw error;
+    }
   }
 
-  async getPoolSnapshot(): Promise<LiquidityPoolSnapshot> {
-    const [totalLiquidity, availableLiquidity, sharePrice, withdrawalFeeBps] =
-      await Promise.all([
-        this.readScaledContractNumber(
-          ["get_total_liquidity", "total_liquidity"],
-          [],
-          "total liquidity",
-        ),
-        this.readScaledContractNumber(
-          ["get_available_liquidity", "available_liquidity", "liquid_assets"],
-          [],
-          "available liquidity",
-        ),
-        this.readSharePrice(),
-        this.readOptionalBasisPoints([
-          "get_withdrawal_fee_bps",
-          "withdrawal_fee_bps",
-          "get_withdraw_fee_bps",
-        ]),
-      ]);
+  async getPoolStats(): Promise<PoolStats> {
+    this.ensureConfigured();
 
-    return {
-      totalLiquidity,
-      availableLiquidity,
-      sharePrice,
-      withdrawalFeeBps,
-    };
+    try {
+      const result = await this.sorobanService.simulateContractCall(
+        this.contractId,
+        'get_pool_stats',
+        [],
+      );
+      const raw = StellarSdk.scValToNative(result) as Record<string, unknown>;
+      const totalLiquidity = this.toBigInt(raw['total_liquidity']);
+      const availableLiquidity = this.toBigInt(raw['available_liquidity']);
+      const totalShares = this.toBigInt(raw['total_shares']);
+      const lockedLiquidity =
+        raw['locked_liquidity'] !== undefined
+          ? this.toBigInt(raw['locked_liquidity'])
+          : totalLiquidity - availableLiquidity;
+      const sharePrice =
+        raw['share_price'] !== undefined
+          ? this.toBigInt(raw['share_price'])
+          : totalShares > 0n
+            ? (totalLiquidity * SHARE_PRICE_BPS) / totalShares
+            : 0n;
+
+      return {
+        totalLiquidity,
+        lockedLiquidity,
+        availableLiquidity,
+        totalShares,
+        sharePrice,
+        withdrawalFeeBps: await this.getWithdrawalFeeBps(),
+      };
+    } catch (error) {
+      this.logger.warn(`get_pool_stats unavailable, falling back to granular reads: ${error.message}`);
+
+      const [totalLiquidity, availableLiquidity, totalShares, withdrawalFeeBps] =
+        await Promise.all([
+          this.readBigInt(['get_total_liquidity', 'total_liquidity'], [], 'total liquidity'),
+          this.readBigInt(
+            ['get_available_liquidity', 'available_liquidity', 'liquid_assets'],
+            [],
+            'available liquidity',
+          ),
+          this.readBigInt(['get_total_shares', 'total_shares'], [], 'total shares'),
+          this.getWithdrawalFeeBps(),
+        ]);
+
+      const lockedLiquidity = totalLiquidity > availableLiquidity ? totalLiquidity - availableLiquidity : 0n;
+      const sharePrice = totalShares > 0n ? (totalLiquidity * SHARE_PRICE_BPS) / totalShares : 0n;
+
+      return {
+        totalLiquidity,
+        lockedLiquidity,
+        availableLiquidity,
+        totalShares,
+        sharePrice,
+        withdrawalFeeBps,
+      };
+    }
   }
 
-  async buildWithdrawTx(userWallet: string, shares: number): Promise<string> {
+  async calculateWithdrawal(sharesInStroops: bigint): Promise<bigint> {
+    this.ensureConfigured();
+
+    const sharesArg = StellarSdk.nativeToScVal(sharesInStroops, { type: 'i128' });
+
+    try {
+      return await this.readBigInt(
+        ['calculate_withdrawal'],
+        [sharesArg],
+        'withdrawal preview',
+      );
+    } catch (error) {
+      this.logger.warn(`calculate_withdrawal unavailable, falling back to share-price math: ${error.message}`);
+      const stats = await this.getPoolStats();
+      if (stats.totalShares <= 0n) {
+        return 0n;
+      }
+      return (sharesInStroops * stats.totalLiquidity) / stats.totalShares;
+    }
+  }
+
+  async buildWithdrawTx(userWallet: string, sharesInStroops: bigint): Promise<string> {
     this.ensureConfigured();
 
     try {
@@ -97,27 +149,19 @@ export class LiquidityContractClient {
       const server = this.sorobanService.getServer();
       const networkPassphrase = this.sorobanService.getNetworkPassphrase();
 
-      const userArg = StellarSdk.nativeToScVal(
-        StellarSdk.Address.fromString(userWallet),
-        {
-          type: "address",
-        },
-      );
-      const sharesArg = StellarSdk.nativeToScVal(this.toScaledBigInt(shares), {
-        type: "i128",
+      const userArg = StellarSdk.nativeToScVal(StellarSdk.Address.fromString(userWallet), {
+        type: 'address',
       });
+      const sharesArg = StellarSdk.nativeToScVal(sharesInStroops, { type: 'i128' });
 
       const sourceKeypair = StellarSdk.Keypair.random();
-      const sourceAccount = new StellarSdk.Account(
-        sourceKeypair.publicKey(),
-        "0",
-      );
+      const sourceAccount = new StellarSdk.Account(sourceKeypair.publicKey(), '0');
 
       const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
         fee: StellarSdk.BASE_FEE,
         networkPassphrase,
       })
-        .addOperation(contract.call("withdraw", userArg, sharesArg))
+        .addOperation(contract.call('withdraw', userArg, sharesArg))
         .setTimeout(300)
         .build();
 
@@ -125,14 +169,12 @@ export class LiquidityContractClient {
 
       if (StellarSdk.SorobanRpc.Api.isSimulationError(simulation)) {
         const errorMsg =
-          (
-            simulation as StellarSdk.SorobanRpc.Api.SimulateTransactionErrorResponse
-          ).error || "Unknown simulation error";
+          (simulation as StellarSdk.SorobanRpc.Api.SimulateTransactionErrorResponse).error ||
+          'Unknown simulation error';
         this.logger.error(`withdraw simulation failed: ${errorMsg}`);
         throw new ServiceUnavailableException({
-          code: "BLOCKCHAIN_SIMULATION_FAILED",
-          message:
-            "Failed to simulate liquidity withdrawal transaction. Please try again later.",
+          code: 'BLOCKCHAIN_SIMULATION_FAILED',
+          message: 'Failed to simulate liquidity withdrawal transaction. Please try again later.',
         });
       }
 
@@ -147,99 +189,52 @@ export class LiquidityContractClient {
         throw error;
       }
 
-      this.logger.error(
-        `Failed to build withdraw transaction: ${error.message}`,
-      );
+      this.logger.error(`Failed to build withdraw transaction: ${error.message}`);
       throw new ServiceUnavailableException({
-        code: "BLOCKCHAIN_TX_BUILD_FAILED",
-        message:
-          "Failed to construct liquidity withdrawal transaction. Please try again later.",
+        code: 'BLOCKCHAIN_TX_BUILD_FAILED',
+        message: 'Failed to construct liquidity withdrawal transaction. Please try again later.',
       });
     }
   }
 
-  private async readSharePrice(): Promise<number> {
-    try {
-      return await this.readScaledContractNumber(
-        ["get_share_price", "share_price", "current_share_price"],
-        [],
-        "share price",
-      );
-    } catch {
-      const [totalLiquidity, totalShares] = await Promise.all([
-        this.readScaledContractNumber(
-          ["get_total_liquidity", "total_liquidity"],
-          [],
-          "total liquidity",
-        ),
-        this.readScaledContractNumber(
-          ["get_total_shares", "total_shares"],
-          [],
-          "total shares",
-        ),
-      ]);
+  private async getWithdrawalFeeBps(): Promise<bigint> {
+    const methods = ['get_withdrawal_fee_bps', 'withdrawal_fee_bps', 'get_withdraw_fee_bps'];
 
-      if (totalShares <= 0) {
-        return 0;
+    for (const method of methods) {
+      try {
+        return await this.readBigInt([method], [], 'withdrawal fee', true);
+      } catch {
+        // try next name
       }
-
-      return this.roundTo7(totalLiquidity / totalShares);
-    }
-  }
-
-  private async readOptionalBasisPoints(methods: string[]): Promise<number> {
-    try {
-      for (const method of methods) {
-        try {
-          const result = await this.sorobanService.simulateContractCall(
-            this.contractId,
-            method,
-            [],
-          );
-          const native = StellarSdk.scValToNative(result);
-          return this.toSafeNumber(native, false);
-        } catch {
-          // try next method name
-        }
-      }
-    } catch {
-      // fall through to default zero
     }
 
-    this.logger.warn(
-      "Withdrawal fee method not available on contract; defaulting fee to 0 bps",
-    );
-    return 0;
+    this.logger.warn('Withdrawal fee method not available on contract; defaulting fee to 0 bps');
+    return 0n;
   }
 
-  private async readScaledContractNumber(
+  private async readBigInt(
     methods: string[],
     args: StellarSdk.xdr.ScVal[],
     label: string,
-  ): Promise<number> {
-    this.ensureConfigured();
-
+    allowContractError = false,
+  ): Promise<bigint> {
     let lastError: unknown;
 
     for (const method of methods) {
       try {
-        const result = await this.sorobanService.simulateContractCall(
-          this.contractId,
-          method,
-          args,
-        );
-        return this.toSafeNumber(StellarSdk.scValToNative(result), true);
+        const result = await this.sorobanService.simulateContractCall(this.contractId, method, args);
+        return this.toBigInt(StellarSdk.scValToNative(result));
       } catch (error) {
         lastError = error;
+        if (allowContractError && this.isMissingProviderError(error)) {
+          throw error;
+        }
       }
     }
 
-    this.logger.error(
-      `Failed to read ${label} from liquidity contract`,
-      lastError as Error,
-    );
+    this.logger.error(`Failed to read ${label} from liquidity contract`, lastError as Error);
     throw new ServiceUnavailableException({
-      code: "BLOCKCHAIN_CONTRACT_READ_FAILED",
+      code: 'BLOCKCHAIN_CONTRACT_READ_FAILED',
       message: `Failed to read ${label} from the liquidity pool contract. Please try again later.`,
     });
   }
@@ -247,47 +242,38 @@ export class LiquidityContractClient {
   private ensureConfigured(): void {
     if (!this.contractId) {
       throw new ServiceUnavailableException({
-        code: "BLOCKCHAIN_CONTRACT_NOT_CONFIGURED",
-        message:
-          "Liquidity pool contract is not configured. Please contact support.",
+        code: 'BLOCKCHAIN_CONTRACT_NOT_CONFIGURED',
+        message: 'Liquidity pool contract is not configured. Please contact support.',
       });
     }
   }
 
-  private toScaledBigInt(value: number): bigint {
-    return BigInt(Math.round(value * STROOPS_SCALE));
+  private isMissingProviderError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('HostError') ||
+      message.includes('Status(ContractError') ||
+      message.includes('Error(Contract')
+    );
   }
 
-  private toSafeNumber(value: unknown, scaled: boolean): number {
-    if (typeof value === "bigint") {
-      return scaled
-        ? this.roundTo7(Number(value) / STROOPS_SCALE)
-        : Number(value);
+  private toBigInt(value: unknown): bigint {
+    if (typeof value === 'bigint') {
+      return value;
     }
 
-    if (typeof value === "number") {
-      return scaled ? this.roundTo7(value / STROOPS_SCALE) : value;
+    if (typeof value === 'number') {
+      return BigInt(Math.round(value));
     }
 
-    if (typeof value === "string") {
-      const parsed = Number(value);
-      if (!Number.isFinite(parsed)) {
-        throw new Error(`Unable to parse contract numeric string: ${value}`);
-      }
-      return scaled ? this.roundTo7(parsed / STROOPS_SCALE) : parsed;
+    if (typeof value === 'string') {
+      return BigInt(value);
     }
 
-    if (value && typeof value === "object" && "toString" in (value as object)) {
-      const parsed = Number(String(value));
-      if (Number.isFinite(parsed)) {
-        return scaled ? this.roundTo7(parsed / STROOPS_SCALE) : parsed;
-      }
+    if (value && typeof value === 'object' && 'toString' in (value as object)) {
+      return BigInt(String(value));
     }
 
     throw new Error(`Unsupported contract numeric value: ${String(value)}`);
-  }
-
-  private roundTo7(value: number): number {
-    return Math.round(value * STROOPS_SCALE) / STROOPS_SCALE;
   }
 }
