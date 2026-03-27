@@ -7,10 +7,13 @@ import {
 } from '@nestjs/common';
 import { ReputationService } from '../reputation/reputation.service';
 import { SupabaseService } from '../../database/supabase.client';
+import { CreditLineContractClient } from '../../blockchain/contracts/credit-line-contract.client';
 import { LoanQuoteRequestDto } from './dto/loan-quote-request.dto';
 import { LoanQuoteResponseDto, SchedulePaymentDto } from './dto/loan-quote-response.dto';
+import { CreateLoanRequestDto } from './dto/create-loan-request.dto';
 import { CreateLoanResponseDto } from './dto/create-loan-response.dto';
-import { CreditLineContractClient } from '../../blockchain/contracts/credit-line-contract.client';
+import { LoanPaymentRequestDto } from './dto/loan-payment-request.dto';
+import { LoanPaymentResponseDto } from './dto/loan-payment-response.dto';
 
 const GUARANTEE_PERCENT = 0.2;
 const LOAN_PERCENT = 0.8;
@@ -55,7 +58,7 @@ export class LoansService {
     return terms;
   }
 
-  async createLoan(wallet: string, dto: LoanQuoteRequestDto): Promise<CreateLoanResponseDto> {
+  async createLoan(wallet: string, dto: CreateLoanRequestDto): Promise<CreateLoanResponseDto> {
     const { merchant, terms } = await this.prepareLoanPreview(wallet, dto, true);
     const loanId = this.generateProvisionalLoanId();
     const description = `Create BNPL loan for $${dto.amount} at ${merchant.name}`;
@@ -107,6 +110,67 @@ export class LoansService {
       xdr,
       description,
       terms,
+    };
+  }
+
+  async repayLoan(
+    wallet: string,
+    loanId: string,
+    dto: LoanPaymentRequestDto,
+  ): Promise<LoanPaymentResponseDto> {
+    const client = this.supabaseService.getServiceRoleClient();
+    const { data: loan, error } = await client
+      .from('loans')
+      .select('id, loan_id, user_wallet, status, remaining_balance')
+      .eq('id', loanId)
+      .single();
+
+    if (error || !loan) {
+      throw new NotFoundException({
+        code: 'LOAN_NOT_FOUND',
+        message: 'Loan not found. Please provide a valid loan ID.',
+      });
+    }
+
+    if (loan.user_wallet !== wallet) {
+      throw new NotFoundException({
+        code: 'LOAN_NOT_FOUND',
+        message: 'Loan not found. Please provide a valid loan ID.',
+      });
+    }
+
+    if (loan.status !== 'active') {
+      throw new BadRequestException({
+        code: 'LOAN_NOT_ACTIVE',
+        message: `Cannot make payments on a loan with status '${loan.status}'. Only active loans can be repaid.`,
+      });
+    }
+
+    const remainingBalance = Number(loan.remaining_balance);
+    if (dto.amount > remainingBalance) {
+      throw new BadRequestException({
+        code: 'LOAN_PAYMENT_EXCEEDS_BALANCE',
+        message: `Payment amount $${dto.amount} exceeds the remaining balance of $${remainingBalance}.`,
+      });
+    }
+
+    const unsignedXdr = await this.creditLineContractClient.buildRepayLoanTx(
+      wallet,
+      loan.loan_id,
+      dto.amount,
+    );
+
+    const newBalance = Math.round((remainingBalance - dto.amount) * 10_000_000) / 10_000_000;
+    const willComplete = newBalance === 0;
+
+    return {
+      unsignedXdr,
+      preview: {
+        paymentAmount: dto.amount,
+        currentBalance: remainingBalance,
+        newBalance,
+        willComplete,
+      },
     };
   }
 

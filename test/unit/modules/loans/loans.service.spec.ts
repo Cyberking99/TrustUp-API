@@ -1,5 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import { LoansService } from '../../../../src/modules/loans/loans.service';
 import { ReputationService } from '../../../../src/modules/reputation/reputation.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
@@ -32,6 +36,7 @@ describe('LoansService', () => {
 
   const mockCreditLineContractClient = {
     buildCreateLoanTransaction: jest.fn(),
+    buildRepayLoanTx: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -47,12 +52,12 @@ describe('LoansService', () => {
     service = module.get<LoansService>(LoansService);
     jest.clearAllMocks();
 
-    // Reset the chained mock for each test
     mockSupabaseClient.from.mockReturnValue(mockSupabaseFrom);
     mockSupabaseFrom.select.mockReturnThis();
     mockSupabaseFrom.eq.mockReturnThis();
     mockSupabaseFrom.insert.mockResolvedValue({ error: null });
     mockCreditLineContractClient.buildCreateLoanTransaction.mockResolvedValue('AAAAAgAAAAC...');
+    mockCreditLineContractClient.buildRepayLoanTx.mockResolvedValue('AAAAAgAAAAA...');
   });
 
   afterEach(() => {
@@ -63,9 +68,6 @@ describe('LoansService', () => {
     expect(service).toBeDefined();
   });
 
-  // ---------------------------------------------------------------------------
-  // calculateLoanQuote
-  // ---------------------------------------------------------------------------
   describe('calculateLoanQuote', () => {
     const baseDto = { amount: 500, merchant: merchantId, term: 4 };
 
@@ -117,8 +119,6 @@ describe('LoansService', () => {
 
       expect(result.interestRate).toBe(8);
       expect(result.loanAmount).toBe(400);
-      // Interest = 400 × 0.08 × (4/12) = 10.67
-      // Total = 400 + 10.67 = 410.67
       expect(result.totalRepayment).toBeCloseTo(410.67, 1);
     });
 
@@ -151,13 +151,11 @@ describe('LoansService', () => {
       mockReputation(40, 'poor', 12, 300);
       mockMerchantFound();
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toThrow(BadRequestException);
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toThrow(
+        BadRequestException,
+      );
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toMatchObject({
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toMatchObject({
         response: { code: 'LOAN_AMOUNT_EXCEEDS_CREDIT' },
       });
     });
@@ -166,13 +164,11 @@ describe('LoansService', () => {
       mockReputation(75, 'silver', 8, 2000);
       mockMerchantNotFound();
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toThrow(NotFoundException);
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toThrow(
+        NotFoundException,
+      );
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toMatchObject({
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toMatchObject({
         response: { code: 'MERCHANT_NOT_FOUND' },
       });
     });
@@ -181,13 +177,11 @@ describe('LoansService', () => {
       mockReputation(75, 'silver', 8, 2000);
       mockMerchantFound(false);
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toThrow(BadRequestException);
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toThrow(
+        BadRequestException,
+      );
 
-      await expect(
-        service.calculateLoanQuote(validWallet, baseDto),
-      ).rejects.toMatchObject({
+      await expect(service.calculateLoanQuote(validWallet, baseDto)).rejects.toMatchObject({
         response: { code: 'MERCHANT_INACTIVE' },
       });
     });
@@ -300,9 +294,89 @@ describe('LoansService', () => {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // generateSchedule
-  // ---------------------------------------------------------------------------
+  describe('repayLoan', () => {
+    const loanId = '11111111-2222-3333-4444-555555555555';
+
+    function mockActiveLoan(overrides: Record<string, unknown> = {}) {
+      mockSupabaseFrom.single.mockResolvedValue({
+        data: {
+          id: loanId,
+          loan_id: 'chain-loan-1',
+          user_wallet: validWallet,
+          status: 'active',
+          remaining_balance: 325,
+          ...overrides,
+        },
+        error: null,
+      });
+    }
+
+    it('should return unsigned XDR and payment preview', async () => {
+      mockActiveLoan();
+
+      const result = await service.repayLoan(validWallet, loanId, { amount: 108.33 });
+
+      expect(result).toEqual({
+        unsignedXdr: 'AAAAAgAAAAA...',
+        preview: {
+          paymentAmount: 108.33,
+          currentBalance: 325,
+          newBalance: 216.67,
+          willComplete: false,
+        },
+      });
+      expect(mockCreditLineContractClient.buildRepayLoanTx).toHaveBeenCalledWith(
+        validWallet,
+        'chain-loan-1',
+        108.33,
+      );
+    });
+
+    it('should throw NotFoundException when loan does not exist', async () => {
+      mockSupabaseFrom.single.mockResolvedValue({
+        data: null,
+        error: { message: 'not found' },
+      });
+
+      await expect(service.repayLoan(validWallet, loanId, { amount: 50 })).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('should throw NotFoundException when loan belongs to another user', async () => {
+      mockActiveLoan({ user_wallet: 'GOTHERWALLETABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFG' });
+
+      await expect(service.repayLoan(validWallet, loanId, { amount: 50 })).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('should throw BadRequestException when loan is not active', async () => {
+      mockActiveLoan({ status: 'pending' });
+
+      await expect(service.repayLoan(validWallet, loanId, { amount: 50 })).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('should throw BadRequestException when payment exceeds balance', async () => {
+      mockActiveLoan({ remaining_balance: 25 });
+
+      await expect(service.repayLoan(validWallet, loanId, { amount: 50 })).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('should mark payment as completing the loan when balance reaches zero', async () => {
+      mockActiveLoan({ remaining_balance: 108.33 });
+
+      const result = await service.repayLoan(validWallet, loanId, { amount: 108.33 });
+
+      expect(result.preview.willComplete).toBe(true);
+      expect(result.preview.newBalance).toBe(0);
+    });
+  });
+
   describe('generateSchedule', () => {
     it('should generate correct number of payments', () => {
       const schedule = service.generateSchedule(400, 4);
@@ -331,7 +405,6 @@ describe('LoansService', () => {
         expect(dueDate.getSeconds()).toBe(0);
       }
 
-      // Each due date should be roughly one month after the previous
       const d1 = new Date(schedule[0].dueDate);
       const d2 = new Date(schedule[1].dueDate);
       const diffDays = (d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24);
@@ -347,7 +420,6 @@ describe('LoansService', () => {
     });
 
     it('should handle rounding remainder in last payment', () => {
-      // 100 / 3 = 33.33 per payment, last payment absorbs remainder
       const schedule = service.generateSchedule(100, 3);
       const sum = schedule.reduce((acc, p) => acc + p.amount, 0);
       expect(Math.round(sum * 100) / 100).toBe(100);
