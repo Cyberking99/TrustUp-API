@@ -13,8 +13,10 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { LiquidityService } from './liquidity.service';
 import { InvestmentSummaryResponseDto } from './dto/investment-summary-response.dto';
+import { PoolOverviewResponseDto } from './dto/pool-overview-response.dto';
 import { LiquidityWithdrawRequestDto } from './dto/liquidity-withdraw-request.dto';
 import { LiquidityWithdrawResponseDto } from './dto/liquidity-withdraw-response.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -24,6 +26,25 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 @Controller('liquidity')
 export class LiquidityController {
   constructor(private readonly liquidityService: LiquidityService) {}
+
+  @Get('overview')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
+  @ApiOperation({
+    summary: 'Get public liquidity pool overview',
+    description:
+      'Returns general metrics about the liquidity pool without requiring authentication. Includes total liquidity, current APY, utilization rate, total unique investors, and active loans. Data is cached for 1 minute.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Pool overview metrics retrieved successfully',
+    type: PoolOverviewResponseDto,
+  })
+  @ApiResponse({ status: 503, description: 'Liquidity contract temporarily unavailable or fallback data used' })
+  async getPoolOverview(): Promise<{ success: boolean; data: PoolOverviewResponseDto; message: string }> {
+    const data = await this.liquidityService.getPoolOverview();
+    return { success: true, data, message: 'Pool overview retrieved successfully' };
+  }
 
   @Get('my-summary')
   @UseGuards(JwtAuthGuard)
