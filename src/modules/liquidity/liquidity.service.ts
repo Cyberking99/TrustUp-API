@@ -13,6 +13,7 @@ import { LiquidityContractClient } from '../../blockchain/contracts/liquidity-co
 import { InvestmentSummaryResponseDto } from './dto/investment-summary-response.dto';
 import { LiquidityWithdrawRequestDto } from './dto/liquidity-withdraw-request.dto';
 import { LiquidityWithdrawResponseDto } from './dto/liquidity-withdraw-response.dto';
+import { PoolOverviewResponseDto } from './dto/pool-overview-response.dto';
 
 const SUMMARY_CACHE_TTL = 60;
 const STROOPS = 10_000_000n;
@@ -70,6 +71,44 @@ export class LiquidityService {
       poolSize,
       activeLoans,
       shares,
+    };
+
+    await this.cacheManager.set(cacheKey, summary, SUMMARY_CACHE_TTL);
+    return summary;
+  }
+
+  async getPoolOverview(): Promise<PoolOverviewResponseDto> {
+    const cacheKey = 'liquidity:overview';
+
+    const cached = await this.cacheManager.get<PoolOverviewResponseDto>(cacheKey);
+    if (cached) {
+      this.logger.debug('Cache HIT for pool overview...');
+      return cached;
+    }
+
+    this.logger.debug('Cache MISS for pool overview... - fetching from sources');
+
+    const [poolStats, loansStats, totalInvestors] = await Promise.all([
+      this.liquidityClient.getPoolStats().catch((err) => {
+        this.logger.warn(`Failed to fetch pool stats from contract: ${err.message}`);
+        return { totalLiquidity: 0n };
+      }),
+      this.getActiveLoansStats(),
+      this.getTotalUniqueInvestors(),
+    ]);
+
+    const totalLiquidity = this.fromStroops(poolStats.totalLiquidity as bigint);
+    const utilization =
+      totalLiquidity > 0
+        ? Math.round((loansStats.totalLoaned / totalLiquidity) * 10000) / 100
+        : 0;
+
+    const summary: PoolOverviewResponseDto = {
+      totalLiquidity,
+      apy: loansStats.estimatedApy,
+      utilization,
+      totalInvestors,
+      activeLoans: loansStats.activeLoans,
     };
 
     await this.cacheManager.set(cacheKey, summary, SUMMARY_CACHE_TTL);
@@ -152,7 +191,11 @@ export class LiquidityService {
     return Number(data.deposited_amount);
   }
 
-  private async getActiveLoansStats(): Promise<{ activeLoans: number; estimatedApy: number }> {
+  private async getActiveLoansStats(): Promise<{
+    activeLoans: number;
+    estimatedApy: number;
+    totalLoaned: number;
+  }> {
     const client = this.supabaseService.getServiceRoleClient();
 
     const { data, error } = await client
@@ -164,7 +207,7 @@ export class LiquidityService {
       if (error) {
         this.logger.warn(`Failed to fetch active loans for APY: ${error.message}`);
       }
-      return { activeLoans: 0, estimatedApy: 0 };
+      return { activeLoans: 0, estimatedApy: 0, totalLoaned: 0 };
     }
 
     const activeLoans = data.length;
@@ -181,7 +224,23 @@ export class LiquidityService {
     return {
       activeLoans,
       estimatedApy: Math.round(weightedRate * LP_FEE_RATIO * 100) / 100,
+      totalLoaned: totalAmount,
     };
+  }
+
+  private async getTotalUniqueInvestors(): Promise<number> {
+    const client = this.supabaseService.getServiceRoleClient();
+
+    const { count, error } = await client
+      .from('liquidity_positions')
+      .select('*', { count: 'exact', head: true });
+
+    if (error) {
+      this.logger.warn(`Failed to fetch investors count: ${error.message}`);
+      return 0;
+    }
+
+    return count || 0;
   }
 
   private toStroops(value: number): bigint {
