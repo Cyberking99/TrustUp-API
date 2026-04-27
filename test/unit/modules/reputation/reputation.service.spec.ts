@@ -31,6 +31,9 @@ describe('ReputationService', () => {
         get: jest.fn((key: string, defaultValue: any) => defaultValue),
     };
 
+    const wallet = 'GABC123TEST';
+    const cacheKey = `reputation:${wallet}`;
+
     beforeEach(async () => {
         const module: TestingModule = await Test.createTestingModule({
             providers: [
@@ -54,9 +57,6 @@ describe('ReputationService', () => {
     });
 
     describe('getReputationScore', () => {
-        const wallet = 'GABC123TEST';
-        const cacheKey = `reputation:${wallet}`;
-
         it('should return cached object from Redis if available (Hot Cache HIT)', async () => {
             const mockReputation: Reputation = {
                 wallet,
@@ -85,32 +85,133 @@ describe('ReputationService', () => {
 
             expect(result.score).toBe(75);
             expect(result.tier).toBe('silver');
-            expect(mockCacheManager.set).toHaveBeenCalled();
+            expect(mockCacheManager.set).toHaveBeenCalledWith(cacheKey, result, 300);
         });
 
-        it('should fetch and map blockchain data correctly', async () => {
+        it('should fetch and map blockchain data correctly when cache misses', async () => {
             mockCacheManager.get.mockResolvedValue(null);
-            mockSupabaseClient.single.mockResolvedValue({ data: null, error: 'Not found' });
+            mockSupabaseClient.single.mockResolvedValueOnce({ data: null, error: 'Not found' })
+                .mockResolvedValueOnce({ data: null, error: null });
+
+            const scoreSpy = jest.spyOn(service as any, 'fetchScoreFromBlockchain');
+            scoreSpy.mockResolvedValue(82);
 
             const result = await service.getReputationScore(wallet);
 
-            expect(result).toHaveProperty('score');
-            expect(result).toHaveProperty('tier');
-            expect(['gold', 'silver', 'bronze', 'poor']).toContain(result.tier);
+            expect(scoreSpy).toHaveBeenCalledWith(wallet);
+            expect(result.score).toBe(82);
+            expect(result.tier).toBe('silver');
+            expect(mockCacheManager.set).toHaveBeenCalledWith(cacheKey, result, 300);
         });
-        it('should fetch from blockchain and use correct column name (wallet_address) for Supabase persistence', async () => {
+
+        it('should persist reputation to Supabase when a user exists', async () => {
             mockCacheManager.get.mockResolvedValue(null);
-            mockSupabaseClient.single.mockResolvedValue({ data: null, error: 'Not found' }); // For initial check
+            mockSupabaseClient.single
+                .mockResolvedValueOnce({ data: null, error: 'Not found' }) // initial warm cache check
+                .mockResolvedValueOnce({ data: { id: 'user-123' }, error: null });
 
-            // Mock user lookup inside persistReputation
-            mockSupabaseClient.single.mockResolvedValueOnce({ data: null, error: 'Not found' })
-                .mockResolvedValueOnce({ data: { id: 'user-id' }, error: null });
+            const scoreSpy = jest.spyOn(service as any, 'fetchScoreFromBlockchain');
+            scoreSpy.mockResolvedValue(92);
 
-            await service.getReputationScore(wallet);
+            const result = await service.getReputationScore(wallet);
 
-            // Verify that we are using 'wallet_address' and not 'wallet'
+            expect(result.score).toBe(92);
+            expect(result.tier).toBe('gold');
             expect(mockSupabaseClient.from).toHaveBeenCalledWith('users');
+            expect(mockSupabaseClient.upsert).toHaveBeenCalledWith(
+                {
+                    user_id: 'user-123',
+                    wallet_address: wallet,
+                    score: 92,
+                    tier: 'gold',
+                    last_synced_at: result.lastUpdated,
+                },
+                { onConflict: 'user_id' },
+            );
+        });
+
+        it('should normalize blockchain score into the 0-100 range', async () => {
+            const score = await service['fetchScoreFromBlockchain'](wallet);
+            expect(typeof score).toBe('number');
+            expect(score).toBeGreaterThanOrEqual(0);
+            expect(score).toBeLessThanOrEqual(100);
+        });
+
+        it('should map score thresholds to credit tiers correctly', () => {
+            const now = new Date().toISOString();
+
+            const gold = service['mapToReputation'](wallet, 90, now);
+            expect(gold.tier).toBe('gold');
+            expect(gold.interestRate).toBe(5);
+            expect(gold.maxCredit).toBe(5000);
+
+            const silver = service['mapToReputation'](wallet, 75, now);
+            expect(silver.tier).toBe('silver');
+            expect(silver.interestRate).toBe(8);
+            expect(silver.maxCredit).toBe(3000);
+
+            const bronze = service['mapToReputation'](wallet, 60, now);
+            expect(bronze.tier).toBe('bronze');
+            expect(bronze.interestRate).toBe(9);
+            expect(bronze.maxCredit).toBe(1500);
+
+            const poor = service['mapToReputation'](wallet, 59, now);
+            expect(poor.tier).toBe('poor');
+            expect(poor.interestRate).toBe(12);
+            expect(poor.maxCredit).toBe(500);
+        });
+
+        it('should fall back to blockchain when Redis cache is unavailable', async () => {
+            mockCacheManager.get.mockRejectedValue(new Error('Redis unavailable'));
+            mockSupabaseClient.single.mockResolvedValueOnce({ data: null, error: 'Not found' })
+                .mockResolvedValueOnce({ data: null, error: null });
+
+            const scoreSpy = jest.spyOn(service as any, 'fetchScoreFromBlockchain');
+            scoreSpy.mockResolvedValue(33);
+
+            const result = await service.getReputationScore(wallet);
+
+            expect(scoreSpy).toHaveBeenCalled();
+            expect(result.score).toBe(33);
+            expect(result.tier).toBe('poor');
+        });
+
+        it('should continue to blockchain when Supabase cache throws an error', async () => {
+            mockCacheManager.get.mockResolvedValue(null);
+            mockSupabaseClient.single.mockRejectedValue(new Error('Supabase unavailable'));
+
+            const scoreSpy = jest.spyOn(service as any, 'fetchScoreFromBlockchain');
+            scoreSpy.mockResolvedValue(68);
+
+            const result = await service.getReputationScore(wallet);
+
+            expect(scoreSpy).toHaveBeenCalledWith(wallet);
+            expect(result.score).toBe(68);
+            expect(result.tier).toBe('bronze');
+        });
+    });
+
+    describe('invalidateReputation', () => {
+        it('should delete the Redis cache key and remove warm cache from Supabase', async () => {
+            mockSupabaseClient.from.mockReturnThis();
+            mockSupabaseClient.eq.mockReturnThis();
+            mockSupabaseClient.delete.mockReturnThis();
+
+            await service.invalidateReputation(wallet);
+
+            expect(mockCacheManager.del).toHaveBeenCalledWith(cacheKey);
+            expect(mockSupabaseClient.from).toHaveBeenCalledWith('reputation_cache');
+            expect(mockSupabaseClient.delete).toHaveBeenCalled();
             expect(mockSupabaseClient.eq).toHaveBeenCalledWith('wallet_address', wallet);
+        });
+
+        it('should swallow errors while invalidating', async () => {
+            mockCacheManager.del.mockRejectedValue(new Error('Redis delete failed'));
+            mockSupabaseClient.from.mockReturnThis();
+            mockSupabaseClient.eq.mockReturnThis();
+            mockSupabaseClient.delete.mockReturnThis();
+
+            await expect(service.invalidateReputation(wallet)).resolves.not.toThrow();
         });
     });
 });
