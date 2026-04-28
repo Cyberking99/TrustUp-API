@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { InternalServerErrorException } from '@nestjs/common';
+import { InternalServerErrorException, ConflictException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../../../../src/modules/auth/auth.service';
@@ -221,6 +221,17 @@ describe('AuthService', () => {
       });
     });
 
+    it('should throw UnauthorizedException (AUTH_SIGNATURE_INVALID) when Keypair throws an unexpected error', async () => {
+      setupMocks();
+      (Keypair.fromPublicKey as jest.Mock).mockImplementation(() => {
+        throw new Error('Unexpected error');
+      });
+
+      await expect(service.verifySignature(validDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_SIGNATURE_INVALID' },
+      });
+    });
+
     it('should verify signature using Stellar Keypair with nonce bytes and base64 signature', async () => {
       const { mockKeypair } = setupMocks();
       await service.verifySignature(validDto);
@@ -319,6 +330,98 @@ describe('AuthService', () => {
 
       await expect(service.generateTokens(validWallet)).rejects.toMatchObject({
         response: { code: 'DATABASE_SESSION_CREATE_FAILED' },
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // register
+  // ---------------------------------------------------------------------------
+  describe('register', () => {
+    const registerDto = {
+      walletAddress: validWallet,
+      username: 'testuser',
+      displayName: 'Test User',
+      termsAccepted: 'true',
+    };
+
+    const mockUser = {
+      id: 'user-uuid',
+      wallet_address: validWallet,
+      username: 'testuser',
+      display_name: 'Test User',
+      avatar_url: 'https://example.com/avatar.png',
+      created_at: new Date().toISOString(),
+    };
+
+    beforeEach(() => {
+      mockUsersRepository.findByWallet.mockResolvedValue(null);
+      mockUsersRepository.checkUsernameExists.mockResolvedValue(false);
+      mockUsersRepository.createProfile.mockResolvedValue(mockUser);
+      mockUsersRepository.uploadAvatar.mockResolvedValue('https://example.com/avatar.png');
+
+      // Mock findOrCreateUser internal behavior via Supabase mock
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          const chain: Record<string, jest.Mock> = {
+            upsert: jest.fn(),
+            select: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: 'active' }, error: null }),
+          };
+          chain.upsert.mockReturnValue(chain);
+          chain.select.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'sessions') {
+          return { insert: jest.fn().mockResolvedValue({ error: null }) };
+        }
+        return { insert: mockInsert };
+      });
+    });
+
+    it('should register a new user successfully without image', async () => {
+      const result = await service.register(registerDto);
+
+      expect(mockUsersRepository.findByWallet).toHaveBeenCalledWith(validWallet);
+      expect(mockUsersRepository.checkUsernameExists).toHaveBeenCalledWith('testuser');
+      expect(mockUsersRepository.createProfile).toHaveBeenCalledWith({
+        wallet: validWallet,
+        username: 'testuser',
+        displayName: 'Test User',
+        avatarUrl: null,
+      });
+      expect(result.user.walletAddress).toBe(validWallet);
+      expect(result.accessToken).toBeDefined();
+    });
+
+    it('should register a new user successfully with profile image', async () => {
+      const mockFile = { buffer: Buffer.from('test'), mimetype: 'image/png' };
+      const result = await service.register(registerDto, mockFile);
+
+      expect(mockUsersRepository.uploadAvatar).toHaveBeenCalledWith(validWallet, mockFile);
+      expect(mockUsersRepository.createProfile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          avatarUrl: 'https://example.com/avatar.png',
+        }),
+      );
+      expect(result.user.avatarUrl).toBe('https://example.com/avatar.png');
+    });
+
+    it('should throw ConflictException if wallet already exists', async () => {
+      mockUsersRepository.findByWallet.mockResolvedValue({ id: 'existing' });
+
+      await expect(service.register(registerDto)).rejects.toThrow(ConflictException);
+      await expect(service.register(registerDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_WALLET_EXISTS' },
+      });
+    });
+
+    it('should throw ConflictException if username is taken', async () => {
+      mockUsersRepository.checkUsernameExists.mockResolvedValue(true);
+
+      await expect(service.register(registerDto)).rejects.toThrow(ConflictException);
+      await expect(service.register(registerDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_USERNAME_TAKEN' },
       });
     });
   });

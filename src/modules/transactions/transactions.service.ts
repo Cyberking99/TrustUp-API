@@ -98,7 +98,7 @@ export class TransactionsService {
       this.handleHorizonError(error);
     }
 
-    this.persistTransactionRecord(wallet, transactionHash, dto.type).catch((err) => {
+    this.persistTransactionRecord(wallet, transactionHash, dto.type, dto.xdr).catch((err) => {
       this.logger.error(
         `Failed to persist transaction record for hash ${transactionHash}: ${err.message}`,
       );
@@ -209,9 +209,19 @@ export class TransactionsService {
     wallet: string,
     hash: string,
     type: TransactionType,
+    xdr: string,
   ): Promise<void> {
     const client = this.supabaseService.getServiceRoleClient();
     const submittedAt = new Date().toISOString();
+    const { error } = await client.from('transactions').insert({
+      user_wallet: wallet,
+      transaction_hash: hash,
+      type,
+      status: 'pending',
+      xdr,
+      submitted_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
 
     const payloads = [
       {
