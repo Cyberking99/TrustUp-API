@@ -21,6 +21,7 @@ const SUMMARY_CACHE_TTL = 60;
 const STROOPS = 10_000_000n;
 const SHARE_PRICE_BPS = 10_000n;
 const LP_FEE_RATIO = 0.85;
+const MIN_DEPOSIT_AMOUNT = 10;
 
 @Injectable()
 export class LiquidityService {
@@ -121,6 +122,13 @@ export class LiquidityService {
     wallet: string,
     dto: LiquidityDepositRequestDto,
   ): Promise<LiquidityDepositResponseDto> {
+    if (dto.amount < MIN_DEPOSIT_AMOUNT) {
+      throw new BadRequestException({
+        code: 'VALIDATION_MINIMUM_DEPOSIT',
+        message: `Minimum deposit amount is $${MIN_DEPOSIT_AMOUNT}.`,
+      });
+    }
+
     const amountInStroops = this.toStroops(dto.amount);
 
     const [poolStats, sharesReceived] = await Promise.all([
