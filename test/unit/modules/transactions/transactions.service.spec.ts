@@ -1,5 +1,7 @@
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import {
+  BadRequestException,
+  InternalServerErrorException,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -8,6 +10,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import * as StellarSdk from 'stellar-sdk';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { TransactionsService } from '../../../../src/modules/transactions/transactions.service';
+import { TransactionType } from '../../../../src/modules/transactions/dto/submit-transaction-request.dto';
 
 const mockTransactionCall = jest.fn();
 const mockIncludeFailed = jest.fn();
@@ -116,7 +119,7 @@ describe('TransactionsService', () => {
     mockCacheManager.get.mockResolvedValue({
       hash: validHash,
       status: 'success',
-      type: 'deposit',
+      type: 'deposit' as TransactionType,
       result: {
         ledger: 123,
         operationCount: 1,
@@ -186,7 +189,7 @@ describe('TransactionsService', () => {
     mockCacheManager.get.mockResolvedValue(undefined);
     mockDbLookup({
       hash: validHash,
-      type: 'deposit',
+      type: 'deposit' as TransactionType,
       status: 'pending',
       submitted_at: '2026-03-23T05:15:00.000Z',
       completed_at: null,
@@ -203,7 +206,7 @@ describe('TransactionsService', () => {
     expect(result).toEqual({
       hash: validHash,
       status: 'pending',
-      type: 'deposit',
+      type: 'deposit' as TransactionType,
       result: null,
       error: null,
       submittedAt: '2026-03-23T05:15:00.000Z',
@@ -228,7 +231,7 @@ describe('TransactionsService', () => {
     mockCacheManager.get.mockResolvedValue(undefined);
     mockDbLookup({
       hash: validHash,
-      type: 'deposit',
+      type: 'deposit' as TransactionType,
       status: 'pending',
       submitted_at: '2026-03-23T05:15:00.000Z',
     });
@@ -243,7 +246,7 @@ describe('TransactionsService', () => {
     mockCacheManager.get.mockResolvedValue(undefined);
     mockDbLookup({
       hash: validHash,
-      type: 'withdraw',
+      type: 'withdraw' as TransactionType,
       status: 'pending',
       submitted_at: '2026-03-23T05:15:00.000Z',
       completed_at: null,
@@ -273,7 +276,7 @@ describe('TransactionsService', () => {
     expect(result).toMatchObject({
       hash: validHash,
       status: 'failed',
-      type: 'withdraw',
+      type: 'withdraw' as TransactionType,
       result: null,
       error: {
         code: 'tx_failed',
@@ -289,5 +292,228 @@ describe('TransactionsService', () => {
       expect.objectContaining({ status: 'failed' }),
       0,
     );
+  });
+
+  // ── Add this helper alongside the existing mockDbLookup / mockTxCallResult ──
+
+  function buildValidXdr(): string {
+    const keypair = StellarSdk.Keypair.random();
+    const account = new StellarSdk.Account(keypair.publicKey(), '0');
+    const tx = new StellarSdk.TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: StellarSdk.Networks.TESTNET,
+    })
+      .addOperation(
+        StellarSdk.Operation.payment({
+          destination: keypair.publicKey(),
+          asset: StellarSdk.Asset.native(),
+          amount: '1',
+        }),
+      )
+      .setTimeout(30)
+      .build();
+    tx.sign(keypair);
+    return tx.toXDR();
+  }
+
+  function buildHorizonResultCodesError(transaction: string, operations: string[] = []): unknown {
+    return {
+      response: { data: { extras: { result_codes: { transaction, operations } } } },
+      message: 'Transaction submission failed',
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // submitTransaction
+  // ══════════════════════════════════════════════════════════════════════════
+
+  describe('submitTransaction', () => {
+    it('returns pending status and the transaction hash on a successful Horizon submission', async () => {
+      mockSubmitTransaction.mockResolvedValue({ hash: validHash });
+
+      const result = await service.submitTransaction(validWallet, {
+        xdr: buildValidXdr(),
+        type: 'deposit' as TransactionType,
+      });
+
+      expect(result).toEqual({ transactionHash: validHash, status: 'pending' });
+      expect(mockSubmitTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws BadRequestException with TRANSACTION_INVALID_XDR when XDR is malformed', async () => {
+      await expect(
+        service.submitTransaction(validWallet, { xdr: 'not-valid-xdr', type: 'deposit' as TransactionType }),
+      ).rejects.toThrow(BadRequestException);
+
+      await expect(
+        service.submitTransaction(validWallet, { xdr: 'not-valid-xdr', type: 'deposit' as TransactionType }),
+      ).rejects.toMatchObject({ response: { code: 'TRANSACTION_INVALID_XDR' } });
+    });
+
+
+    it('throws BadRequestException mapped from a known tx-level result code (tx_bad_auth)', async () => {
+      mockSubmitTransaction.mockRejectedValue(
+        buildHorizonResultCodesError('tx_bad_auth'),
+      );
+
+      await expect(
+        service.submitTransaction(validWallet, { xdr: buildValidXdr(), type: 'deposit' as TransactionType }),
+      ).rejects.toMatchObject({
+        response: { code: 'STELLAR_TX_BAD_AUTH' },
+      });
+    });
+
+    it('throws BadRequestException with STELLAR_TRANSACTION_FAILED for an unmapped result code', async () => {
+      mockSubmitTransaction.mockRejectedValue(
+        buildHorizonResultCodesError('tx_some_unknown_code'),
+      );
+
+      await expect(
+        service.submitTransaction(validWallet, { xdr: buildValidXdr(), type: 'deposit' as TransactionType }),
+      ).rejects.toMatchObject({
+        response: { code: 'STELLAR_TRANSACTION_FAILED' },
+      });
+    });
+
+    it('throws ServiceUnavailableException when Horizon submission times out', async () => {
+      mockSubmitTransaction.mockRejectedValue(new Error('network timeout'));
+
+      await expect(
+        service.submitTransaction(validWallet, { xdr: buildValidXdr(), type: 'deposit' as TransactionType }),
+      ).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it('throws InternalServerErrorException for an unexpected Horizon submission error', async () => {
+      mockSubmitTransaction.mockRejectedValue(new Error('something unexpected'));
+
+      await expect(
+        service.submitTransaction(validWallet, { xdr: buildValidXdr(), type: 'deposit' as TransactionType }),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // getTransactionStatus – additional cases
+  // ══════════════════════════════════════════════════════════════════════════
+
+  describe('getTransactionStatus – additional', () => {
+    it('normalises an uppercase hash to lowercase before cache key and DB lookup', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup(null);
+      mockTxCallResult(Promise.reject({ response: { status: 404 } }));
+
+      await expect(service.getTransactionStatus(validHash.toUpperCase())).rejects.toThrow(
+        NotFoundException,
+      );
+
+      expect(mockCacheManager.get).toHaveBeenCalledWith(
+        `transactions:status:${validHash.toLowerCase()}`,
+      );
+    });
+
+    it('returns type: null when a finalized transaction has no local DB record', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup(null);
+      mockTxCallResult({
+        hash: validHash,
+        successful: true,
+        ledger_attr: 1,
+        operation_count: 1,
+        source_account: validWallet,
+        fee_charged: '100',
+        memo_type: 'none',
+        memo: undefined,
+        created_at: now,
+        result_xdr: '',
+      });
+
+      const result = await service.getTransactionStatus(validHash);
+
+      expect(result.status).toBe('success');
+      expect(result.type).toBeNull();
+    });
+
+    it('throws ServiceUnavailableException when Horizon returns 502 during status lookup', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup({ hash: validHash, type: 'deposit' as TransactionType, status: 'pending', submitted_at: now });
+      mockTxCallResult(Promise.reject({ response: { status: 502 } }));
+
+      await expect(service.getTransactionStatus(validHash)).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+    });
+
+    it('throws ServiceUnavailableException when Horizon returns 503 during status lookup', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup({ hash: validHash, type: 'deposit' as TransactionType, status: 'pending', submitted_at: now });
+      mockTxCallResult(Promise.reject({ response: { status: 503 } }));
+
+      await expect(service.getTransactionStatus(validHash)).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+    });
+
+    it('throws InternalServerErrorException for an unexpected Horizon status-lookup error', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup({ hash: validHash, type: 'deposit' as TransactionType, status: 'pending', submitted_at: now });
+      mockTxCallResult(
+        Promise.reject({ response: { status: 500 }, message: 'server error' }),
+      );
+
+      await expect(service.getTransactionStatus(validHash)).rejects.toThrow(
+        InternalServerErrorException,
+      );
+    });
+
+    it('skips DB persistence when there is no local transaction record', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+      mockDbLookup(null);
+      mockTxCallResult({
+        hash: validHash,
+        successful: true,
+        ledger_attr: 1,
+        operation_count: 1,
+        source_account: validWallet,
+        fee_charged: '100',
+        memo_type: 'none',
+        memo: undefined,
+        created_at: now,
+        result_xdr: '',
+      });
+
+      await service.getTransactionStatus(validHash);
+
+      expect(mockSupabaseTable.update).not.toHaveBeenCalled();
+    });
+
+    it('falls back to transaction_hash column when hash column does not exist in DB', async () => {
+      mockCacheManager.get.mockResolvedValue(undefined);
+
+      mockSupabaseTable.select.mockReturnThis();
+      mockSupabaseTable.eq.mockReturnThis();
+      mockSupabaseTable.maybeSingle
+        .mockResolvedValueOnce({
+          data: null,
+          error: { message: 'column "hash" does not exist' },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            transaction_hash: validHash,
+            type: 'deposit' as TransactionType,
+            status: 'pending',
+            submitted_at: now,
+            completed_at: null,
+            updated_at: now,
+          },
+          error: null,
+        });
+
+      mockTxCallResult(Promise.reject({ response: { status: 404 } }));
+
+      const result = await service.getTransactionStatus(validHash);
+
+      expect(result.status).toBe('pending');
+      expect(result.type).toBe('deposit');
+    });
   });
 });
