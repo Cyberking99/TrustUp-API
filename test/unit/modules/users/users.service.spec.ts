@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { UsersService } from '../../../../src/modules/users/users.service';
 import { UsersRepository } from '../../../../src/database/repositories/users.repository';
+import { UpdateUserDto } from '../../../../src/modules/users/dto/update-user.dto';
 
 describe('UsersService', () => {
     let service: UsersService;
@@ -113,6 +114,27 @@ describe('UsersService', () => {
             expect(repository.createDefaultPreferences).toHaveBeenCalledWith(legacyUser.id);
             expect(result.preferences.theme).toBe('system');
         });
+
+        it('should propagate error if findByWallet fails', async () => {
+            mockUsersRepository.findByWallet.mockRejectedValue(new Error('DB connection failed'));
+
+            await expect(service.getOrCreateProfile('GABC...')).rejects.toThrow('DB connection failed');
+        });
+
+        it('should propagate error if create fails', async () => {
+            mockUsersRepository.findByWallet.mockResolvedValue(null);
+            mockUsersRepository.create.mockRejectedValue(new Error('Insertion failed'));
+
+            await expect(service.getOrCreateProfile('GABC...')).rejects.toThrow('Insertion failed');
+        });
+
+        it('should propagate error if createDefaultPreferences fails during first login', async () => {
+            mockUsersRepository.findByWallet.mockResolvedValue(null);
+            mockUsersRepository.create.mockResolvedValue(mockNewUser);
+            mockUsersRepository.createDefaultPreferences.mockRejectedValue(new Error('Pref creation failed'));
+
+            await expect(service.getOrCreateProfile('GABC...')).rejects.toThrow('Pref creation failed');
+        });
     });
 
     // ---------------------------------------------------------------------------
@@ -202,6 +224,80 @@ describe('UsersService', () => {
                 wallet,
                 expect.objectContaining({ name: 'Maria' }),
             );
+        });
+
+        it('should handle repository.update failure (e.g. database error)', async () => {
+            mockUsersRepository.update.mockRejectedValue(new Error('Update failed'));
+
+            await expect(service.updateProfile(wallet, { name: 'Maria' })).rejects.toThrow('Update failed');
+        });
+
+        it('should use default preferences if findByWallet returns null after update', async () => {
+            mockUsersRepository.update.mockResolvedValue(mockUpdatedUser);
+            mockUsersRepository.findByWallet.mockResolvedValue(null); // Edge case
+
+            const result = await service.updateProfile(wallet, { name: 'Maria' });
+
+            expect(result.preferences).toEqual({
+                notifications: true,
+                language: 'en',
+                theme: 'system',
+            });
+        });
+
+        it('should handle case where user exists but group preferences are missing after update', async () => {
+            mockUsersRepository.update.mockResolvedValue(mockUpdatedUser);
+            mockUsersRepository.findByWallet.mockResolvedValue({
+                ...mockExistingUser,
+                user_preferences: null,
+            });
+
+            const result = await service.updateProfile(wallet, { name: 'Maria' });
+
+            expect(result.preferences).toEqual({
+                notifications: true,
+                language: 'en',
+                theme: 'system',
+            });
+        });
+
+        it('should update all fields successfully when multiple are provided', async () => {
+            const multiUpdateDto: UpdateUserDto = {
+                name: 'Maria G',
+                avatar: 'https://example.com/new.jpg',
+                preferences: { notifications: false, theme: 'dark', language: 'es' },
+            };
+
+            const updatedUserRecord = {
+                ...mockUpdatedUser,
+                display_name: 'Maria G',
+                avatar_url: 'https://example.com/new.jpg',
+            };
+
+            const updatedPrefsRecord = {
+                notifications_enabled: false,
+                theme: 'dark',
+                language: 'es',
+            };
+
+            mockUsersRepository.update.mockResolvedValue(updatedUserRecord);
+            mockUsersRepository.findByWallet.mockResolvedValue({
+                ...mockExistingUser,
+                display_name: 'Maria G',
+                avatar_url: 'https://example.com/new.jpg',
+                user_preferences: updatedPrefsRecord,
+            });
+
+            const result = await service.updateProfile(wallet, multiUpdateDto);
+
+            expect(repository.update).toHaveBeenCalledWith(wallet, multiUpdateDto);
+            expect(result.name).toBe('Maria G');
+            expect(result.avatar).toBe('https://example.com/new.jpg');
+            expect(result.preferences).toEqual({
+                notifications: false,
+                theme: 'dark',
+                language: 'es',
+            });
         });
     });
 });
