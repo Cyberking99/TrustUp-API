@@ -12,6 +12,7 @@
  */
 
 import { createTestKeypair, signMessage } from '../helpers';
+import { TransactionType } from '../../src/modules/transactions/dto/submit-transaction-request.dto';
 
 /**
  * Creates a mock nonce response
@@ -47,6 +48,10 @@ export const createMockAuthResponse = (overrides?: any) => ({
   expiresIn: 900,
   tokenType: 'Bearer',
   ...overrides,
+  user: {
+    wallet: createTestKeypair().publicKey(),
+    ...overrides?.user,
+  },
 });
 
 /**
@@ -63,4 +68,52 @@ export const createMockRegisterRequest = (overrides?: any) => {
     ...overrides,
   };
 };
+
+/**
+ * Creates a mock submit transaction request
+ */
+export const createMockSubmitTransactionRequest = (overrides?: any) => ({
+  xdr: 'AAAAAgAAAAA...', // Dummy XDR
+  type: TransactionType.DEPOSIT,
+  ...overrides,
+});
+
+/**
+ * Creates a mock Horizon transaction record
+ */
+export const createMockHorizonTransaction = (overrides?: any) => ({
+  hash: 'a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890',
+  successful: true,
+  ledger_attr: 123456,
+  operation_count: 1,
+  source_account: 'GC3X3S5VX6V...',
+  fee_charged: '100',
+  memo_type: 'none',
+  created_at: new Date().toISOString(),
+  result_xdr: 'AAAAAAAAAGQAAAAAAAAAAQAAAAAAAAAAAAAAAQAAAAAAAAAA',
+  ...overrides,
+});
+
+/**
+ * Creates a mock transaction status response
+ */
+export const createMockTransactionStatusResponse = (overrides?: any) => ({
+  hash: 'a1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890',
+  status: 'success',
+  type: TransactionType.DEPOSIT,
+  result: {
+    ledger: 123456,
+    operationCount: 1,
+    sourceAccount: 'GC3X3S5VX6V...',
+    feeCharged: '100',
+    memoType: 'none',
+    memo: null,
+    createdAt: new Date().toISOString(),
+  },
+  error: null,
+  submittedAt: new Date().toISOString(),
+  confirmedAt: new Date().toISOString(),
+  lastCheckedAt: new Date().toISOString(),
+  ...overrides,
+});
 

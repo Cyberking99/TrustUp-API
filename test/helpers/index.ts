@@ -9,7 +9,7 @@
  * };
  */
 
-import { Keypair } from 'stellar-sdk';
+import { Keypair, TransactionBuilder, Asset, Operation, Networks, Account } from 'stellar-sdk';
 
 /**
  * Creates a random Stellar keypair for testing
@@ -41,5 +41,30 @@ export const createTestUserData = (overrides?: any) => ({
  */
 export const createTestWallet = () => {
   return createTestKeypair().publicKey();
+};
+
+/**
+ * Creates a valid signed Stellar XDR for testing
+ */
+export const createValidTestXdr = (sourceKeypair: Keypair = createTestKeypair()) => {
+  const publicKey = sourceKeypair.publicKey();
+  const account = new Account(publicKey, '1');
+  // We need to mock the sequence number for the builder
+  const transaction = new TransactionBuilder(account, {
+    fee: '100',
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(
+      Operation.payment({
+        destination: createTestKeypair().publicKey(),
+        asset: Asset.native(),
+        amount: '10',
+      }),
+    )
+    .setTimeout(0)
+    .build();
+
+  transaction.sign(sourceKeypair);
+  return transaction.toXDR();
 };
 

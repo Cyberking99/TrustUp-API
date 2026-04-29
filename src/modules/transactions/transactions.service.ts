@@ -173,7 +173,7 @@ export class TransactionsService {
     if (resultCodes) {
       const txCode = resultCodes.transaction;
       const opCodes = resultCodes.operations ?? [];
-      const allCodes = [txCode, ...opCodes].filter(Boolean);
+      const allCodes = [...opCodes, txCode].filter(Boolean);
 
       for (const code of allCodes) {
         if (code && HORIZON_ERROR_MAP[code]) {
